@@ -1,11 +1,25 @@
 package sokv
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/nyan233/sokv/internal/sys"
 	"hash/crc32"
 	"os"
+	"strconv"
 	"unsafe"
+)
+
+const (
+	defaultPageCount = 256 * 1024 * 16
+	pgIdMemSize      = unsafe.Sizeof(pageRecord{})
+)
+
+const (
+	PageHeaderMetadata uint8 = iota + 1
+	PageHeaderFreeList
+	PageHeaderDat
 )
 
 var (
@@ -20,53 +34,148 @@ type metaHeader struct {
 	datLen       uint16
 }
 
-type mmapPsMetadata struct {
-	header *metaHeader
+type metadata struct {
+	rawBuf []byte
+	header metaHeader
 	data   []byte
 }
 
-func (m *mmapPsMetadata) minSize() uint32 {
+func (m *metadata) minSize() uint32 {
 	return uint32(unsafe.Sizeof(metaHeader{}))
 }
 
-type mmapPsFreelist struct {
-	header   uint8
-	pgId     pageId
-	count    uint16
-	overflow pageId
-	freelist []pageId
+func (m *metadata) checksum() uint32 {
+	return crc32.ChecksumIEEE(m.rawBuf[8:])
 }
 
-func (p *mmapPsFreelist) minSize() uint32 {
-	return uint32(unsafe.Sizeof(mmapPsFreelist{})) - 24
+func (m *metadata) parse(v []byte) {
+	if len(v) < int(m.minSize()) {
+		panic("value too short")
+	}
+	m.rawBuf = v
+	m.header.header = [4]byte(v[0:4])
+	m.header.sum = binary.BigEndian.Uint32(v[4:8])
+	m.header.sysPageSize = binary.BigEndian.Uint32(v[8:12])
+	m.header.rootNodePgId = pageId(v[12:18])
+	m.header.datLen = binary.BigEndian.Uint16(v[18:20])
+	m.data = v[20:]
 }
 
-type mmapPageStorage struct {
-	mapFile     *os.File
+func (m *metadata) writeHeader2RawBuf() {
+	copy(m.rawBuf[0:4], m.header.header[:])
+	binary.BigEndian.PutUint32(m.rawBuf[8:], m.header.sysPageSize)
+	copy(m.rawBuf[12:18], m.header.rootNodePgId[:])
+	binary.BigEndian.PutUint16(m.rawBuf[18:20], m.header.datLen)
+	// update checksum
+	m.header.sum = crc32.ChecksumIEEE(m.rawBuf[8:])
+	binary.BigEndian.PutUint32(m.rawBuf[4:], m.header.sum)
+}
+
+type pageHeader struct {
+	Header uint8
+	sum    uint32
+	// PgId msb ~= 2^48
+	PgId  pageId
+	Flags uint64
+	// PgId msb ~= 2^48
+	Overflow pageId
+}
+
+type pageDesc struct {
+	TxSeq uint64
+	// NOTE : 无论你有什么理由都不能手动操作原始缓冲区
+	rawBuf []byte
+	Header pageHeader
+	Data   []byte
+}
+
+func (p *pageDesc) minSize() uint32 {
+	return uint32(unsafe.Sizeof(pageHeader{}))
+}
+
+// SetFlags NOTE: 注意, 如果这个页头是由mmap分配, 那么这个改动将刷新到磁盘, 将刷新到磁盘, 将刷新到磁盘, 重要的事情说三遍
+func (p *pageDesc) SetFlags(flags uint64) {
+	p.Header.Flags = flags
+}
+
+func (p *pageDesc) parse(v []byte) {
+	if len(v) < int(p.minSize()) {
+		panic("v length too short")
+	}
+	p.rawBuf = v
+	p.Header.Header = v[0]
+	p.Header.sum = binary.BigEndian.Uint32(v[1:5])
+	p.Header.PgId = pageId(v[5:11])
+	p.Header.Flags = binary.BigEndian.Uint64(v[11:19])
+	p.Header.Overflow = pageId(v[19:25])
+	p.Data = v[25:]
+}
+
+func (p *pageDesc) checksum() uint32 {
+	return crc32.ChecksumIEEE(p.rawBuf[5:])
+}
+
+func (p *pageDesc) writeHeader2RawBuf() {
+	p.rawBuf[0] = p.Header.Header
+	copy(p.rawBuf[5:11], p.Header.PgId[:])
+	binary.BigEndian.PutUint64(p.rawBuf[11:19], p.Header.Flags)
+	copy(p.rawBuf[19:25], p.Header.Overflow[:])
+
+	// update checksum
+	p.Header.sum = crc32.ChecksumIEEE(p.rawBuf[5:])
+	binary.BigEndian.PutUint32(p.rawBuf[1:5], p.Header.sum)
+}
+
+type pageId [6]byte
+
+func (p *pageId) ToUint64() uint64 {
+	return uint64(p[0])<<40 | uint64(p[1])<<32 | uint64(p[2])<<24 | uint64(p[3])<<16 | uint64(p[4])<<8 | uint64(p[5])
+}
+
+func (p *pageId) FromUint64(v uint64) {
+	p[0] = byte(v >> 40)
+	p[1] = byte(v >> 32)
+	p[2] = byte(v >> 24)
+	p[3] = byte(v >> 16)
+	p[4] = byte(v >> 8)
+	p[5] = byte(v)
+}
+
+func (p *pageId) String() string {
+	return strconv.FormatUint(p.ToUint64(), 10)
+}
+
+func createPageIdFromUint64(v uint64) (p pageId) {
+	p.FromUint64(v)
+	return
+}
+
+type pageStorage struct {
+	file        *os.File
 	path        string
-	dat         []byte
 	sysPageSize uint32
 	freelist    *freelist
+	cache       *pageCache
 }
 
-func newMMapPageStorage(path string) *mmapPageStorage {
-	return &mmapPageStorage{
+func newMMapPageStorage(path string) *pageStorage {
+	return &pageStorage{
 		path: path,
 	}
 }
 
-func (m *mmapPageStorage) getPageSize() uint32 {
+func (m *pageStorage) getPageSize() uint32 {
 	return m.sysPageSize
 }
 
-func (m *mmapPageStorage) init() (err error) {
-	m.mapFile, err = os.OpenFile(m.path, os.O_CREATE|os.O_RDWR, 0644)
+func (m *pageStorage) init() (err error) {
+	m.file, err = sys.OpenFile(m.path)
 	if err != nil {
 		return
 	}
 	m.sysPageSize = uint32(sys.GetSysPageSize())
 	var fileSize uint64
-	stat, err := m.mapFile.Stat()
+	stat, err := m.file.Stat()
 	if err != nil {
 		return
 	}
@@ -75,69 +184,97 @@ func (m *mmapPageStorage) init() (err error) {
 		err = m.initFile()
 		return
 	}
-	m.dat, err = sys.MMap(m.mapFile, fileSize)
-	metadata := m.getMetadata(false)
-	m.sysPageSize = metadata.header.sysPageSize
+	var md metadata
+	md, err = m.getMetadata(false)
+	if err != nil {
+		return
+	}
+	m.sysPageSize = md.header.sysPageSize
 	m.freelist = newFreelist(m.path + ".freelist")
 	return m.freelist.init()
 }
 
-func (m *mmapPageStorage) initFile() (err error) {
+func (m *pageStorage) initFile() (err error) {
 	defaultSize := uint64(m.sysPageSize) * defaultPageCount
-	err = m.mapFile.Truncate(int64(defaultSize))
+	err = m.file.Truncate(int64(defaultSize))
 	if err != nil {
 		return err
 	}
-	m.dat, err = sys.MMap(m.mapFile, defaultSize)
+	// init metadata
+	var md metadata
+	md, err = m.getMetadata(true)
 	if err != nil {
 		return
 	}
-	// init metadata
-	metadata := m.getMetadata(true)
-	metadata.header.header = medataHeader
-	metadata.header.sysPageSize = m.sysPageSize
+	md.header.header = medataHeader
+	md.header.sysPageSize = m.sysPageSize
 	// init freelist
 	m.freelist = newFreelist(m.path + ".freelist")
 	err = m.freelist.init()
 	if err != nil {
 		return
 	}
-	metadata.header.rootNodePgId.FromUint64(2)
-	metadata.header.sum = crc32.ChecksumIEEE(unsafe.Slice((*byte)(unsafe.Pointer(&m.dat[0])), metadata.header.sysPageSize))
+	md.header.rootNodePgId.FromUint64(2)
+	md.writeHeader2RawBuf()
+	err = m.writeRawPage(createPageIdFromUint64(0), md.rawBuf)
+	if err != nil {
+		return
+	}
 	for i := 3; i < defaultPageCount; i++ {
-		err = m.freelist.pushOne(createPageIdFromUint64(uint64(i)))
+		err = m.freelist.pushOne(0, createPageIdFromUint64(uint64(i)))
 		if err != nil {
 			return
 		}
 	}
-	var rootPage *pageDesc
-	rootPage, err = m.readPage(createPageIdFromUint64(2))
-	if err != nil {
-		return
-	}
-	rootPage.Header.Header = PageHeaderDat
-	rootPage.Header.PgId = createPageIdFromUint64(2)
 	return
 }
 
-func (m *mmapPageStorage) getMetadata(isInit bool) *mmapPsMetadata {
-	ptr := unsafe.Pointer(&m.dat[0])
-	metadata := &mmapPsMetadata{
-		header: (*metaHeader)(ptr),
+func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
+	var (
+		md       metadata
+		pageSize = m.sysPageSize
+	)
+	if m.sysPageSize == 0 {
+		pageSize = uint32(sys.GetSysPageSize())
 	}
+	cp, found := m.cache.readPage(0)
+	if found {
+		md.parse(cp.data)
+		return md, nil
+	}
+	rawPage, err := m.readRawPage(createPageIdFromUint64(0), int(pageSize))
+	if err != nil {
+		return md, err
+	}
+	md.parse(rawPage)
 	var byteLen int
 	if isInit {
 		byteLen = int(m.sysPageSize)
 	} else {
-		byteLen = int(metadata.header.sysPageSize)
+		byteLen = int(md.header.sysPageSize)
+		if md.checksum() != md.header.sum {
+			err = errors.New("metadata page corrupted")
+			return md, err
+		}
 	}
-	metadata.data = unsafe.Slice((*byte)(&m.dat[metadata.minSize()]), byteLen)
-	return metadata
+	if byteLen != len(rawPage) {
+		rawPage, err = m.readRawPage(createPageIdFromUint64(0), int(m.sysPageSize))
+		if err != nil {
+			return md, err
+		}
+		md.parse(rawPage)
+	}
+	m.cache.setReadValue(cachePage{
+		txSeq: 0,
+		data:  md.data,
+		pgId:  createPageIdFromUint64(0),
+	})
+	return md, nil
 }
 
-func (m *mmapPageStorage) grow() (err error) {
+func (m *pageStorage) grow() (err error) {
 	// 大于1GB之后每次增长1GB, 小于1GB则*2
-	stat, err := m.mapFile.Stat()
+	stat, err := m.file.Stat()
 	if err != nil {
 		return err
 	}
@@ -146,11 +283,7 @@ func (m *mmapPageStorage) grow() (err error) {
 	if fileSize > 1024*1024*1024 {
 		newFileSize = fileSize + 1024*1024*1024
 	}
-	err = m.mapFile.Truncate(newFileSize)
-	if err != nil {
-		return err
-	}
-	m.dat, err = sys.Remap(m.mapFile, uint64(newFileSize), m.dat)
+	err = m.file.Truncate(newFileSize)
 	if err != nil {
 		return err
 	}
@@ -165,58 +298,92 @@ func (m *mmapPageStorage) grow() (err error) {
 	return
 }
 
-func (m *mmapPageStorage) close() (err error) {
-	err = m.mapFile.Close()
+func (m *pageStorage) close() (err error) {
+	err = m.file.Close()
 	if err != nil {
 		return
 	}
-	m.mapFile = nil
-	m.dat = nil
+	m.file = nil
 	return
 }
 
-func (m *mmapPageStorage) readRootPage() (*pageDesc, error) {
-	metadata := m.getMetadata(false)
-	return m.readPage(metadata.header.rootNodePgId)
+func (m *pageStorage) readRootPage() (pd pageDesc, err error) {
+	md, err := m.getMetadata(false)
+	if err != nil {
+		return pd, err
+	}
+	return m.readPage(md.header.rootNodePgId)
 }
 
-func (m *mmapPageStorage) setRootPage(desc *pageDesc) error {
-	metadata := m.getMetadata(false)
-	metadata.header.rootNodePgId = desc.Header.PgId
-	// sum只计算Header和sum字段后面的值
-	metadata.header.sum = crc32.ChecksumIEEE(unsafe.Slice((*byte)(unsafe.Pointer(&m.dat[8])), metadata.header.sysPageSize-8))
+func (m *pageStorage) setRootPage(pd pageDesc) error {
+	return m.setRootPageWithPageId(pd.TxSeq, pd.Header.PgId)
+}
+
+func (m *pageStorage) setRootPageWithPageId(txSeq uint64, rootPgId pageId) error {
+	if txSeq == 0 {
+		return fmt.Errorf("invalid tx seq: %d", txSeq)
+	}
+	md, err := m.getMetadata(false)
+	if err != nil {
+		return err
+	}
+	pgId := createPageIdFromUint64(0)
+	md.header.rootNodePgId = rootPgId
+	md.writeHeader2RawBuf()
+	m.cache.setDirtyPage(cachePage{
+		txSeq: txSeq,
+		data:  md.rawBuf,
+		pgId:  pgId,
+	})
 	return nil
 }
 
-func (m *mmapPageStorage) setRootPageWithPageId(pgId pageId) error {
-	metadata := m.getMetadata(false)
-	metadata.header.rootNodePgId = pgId
-	// sum只计算Header和sum字段后面的值
-	metadata.header.sum = crc32.ChecksumIEEE(unsafe.Slice((*byte)(unsafe.Pointer(&m.dat[8])), metadata.header.sysPageSize-8))
-	return nil
-}
-
-func (m *mmapPageStorage) setLocalData(b []byte) error {
-	metadata := m.getMetadata(false)
-	maxSize := int(m.sysPageSize - metadata.minSize())
+// NOTE: 不允许在事务中执行, 会直接写原始页, 一般只用于初始化时设置配置
+func (m *pageStorage) setLocalData(b []byte) error {
+	md, err := m.getMetadata(false)
+	if err != nil {
+		return err
+	}
+	maxSize := int(m.sysPageSize - md.minSize())
 	if len(b) > maxSize {
 		return fmt.Errorf("data too large : len(b) == %d > maxSize(%d)", len(b), maxSize)
 	}
-	metadata.header.datLen = uint16(len(b))
-	copy(metadata.data, b)
-	// sum只计算Header和sum字段后面的值
-	metadata.header.sum = crc32.ChecksumIEEE(unsafe.Slice((*byte)(unsafe.Pointer(&m.dat[8])), metadata.header.sysPageSize-8))
-	return nil
+	md.header.datLen = uint16(len(b))
+	copy(md.data, b)
+	md.writeHeader2RawBuf()
+	pgId := createPageIdFromUint64(0)
+	m.cache.setReadValue(cachePage{
+		txSeq: 0,
+		data:  md.data,
+		pgId:  pgId,
+	})
+	return m.writeRawPage(pgId, md.rawBuf)
 }
 
-func (m *mmapPageStorage) loadLocalData() ([]byte, error) {
-	metadata := m.getMetadata(false)
-	buf := make([]byte, metadata.header.datLen)
-	copy(buf, metadata.data[:metadata.header.datLen])
+func (m *pageStorage) loadLocalData() ([]byte, error) {
+	md, err := m.getMetadata(false)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, md.header.datLen)
+	copy(buf, md.data[:md.header.datLen])
 	return buf, nil
 }
 
-func (m *mmapPageStorage) allocPage(n int) (res []pageId, err error) {
+func (m *pageStorage) writePage(pd pageDesc) error {
+	if pd.TxSeq == 0 {
+		return fmt.Errorf("invalid tx seq: %d", pd.TxSeq)
+	}
+	pd.writeHeader2RawBuf()
+	m.cache.setDirtyPage(cachePage{
+		txSeq: pd.TxSeq,
+		data:  nil,
+		pgId:  pageId{},
+	})
+	return nil
+}
+
+func (m *pageStorage) allocPage(txSeq uint64, n int) (res []pageId, err error) {
 	res = make([]pageId, 0, n)
 	res, err = m.freelist.pop(n)
 	if err != nil {
@@ -234,19 +401,10 @@ func (m *mmapPageStorage) allocPage(n int) (res []pageId, err error) {
 		}
 		res = append(res, pageIdList2...)
 	}
-	return res, m.setDatPageHeader(res)
+	return res, nil
 }
 
-func (m *mmapPageStorage) setDatPageHeader(res []pageId) error {
-	for _, v := range res {
-		header := (*pageHeader)(unsafe.Pointer(&m.dat[v.ToUint64()*uint64(m.sysPageSize)]))
-		header.Header = PageHeaderDat
-		header.PgId = v
-	}
-	return nil
-}
-
-func (m *mmapPageStorage) freePage(pgIdList []pageId) error {
+func (m *pageStorage) freePage(txSeq uint64, pgIdList []pageId) error {
 	for _, pgId := range pgIdList {
 		if pgId.ToUint64() < 2 {
 			return fmt.Errorf("free page type not is dat")
@@ -255,39 +413,59 @@ func (m *mmapPageStorage) freePage(pgIdList []pageId) error {
 	return m.freelist.push(pgIdList)
 }
 
-func (m *mmapPageStorage) readPage(pgId pageId) (pd *pageDesc, err error) {
-	if pgId.ToUint64() < 2 {
-		return nil, fmt.Errorf("read page type not is dat : %d", pgId.ToUint64())
+func (m *pageStorage) readRawPage(pgId pageId, expectLen int) ([]byte, error) {
+	buf := make([]byte, expectLen)
+	readCount, err := m.file.ReadAt(buf, int64(pgId.ToUint64()*uint64(m.sysPageSize)))
+	if err != nil {
+		return nil, err
 	}
-	pd = new(pageDesc)
-	pd.Header = (*pageHeader)(unsafe.Pointer(&m.dat[pgId.ToUint64()*uint64(m.sysPageSize)]))
-	pd.Data = unsafe.Slice((*byte)(unsafe.Pointer(&m.dat[pgId.ToUint64()*uint64(m.sysPageSize)+uint64(pd.minSize())])), m.sysPageSize-pd.minSize())
+	if readCount != expectLen {
+		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, expectLen)
+	}
+	return buf, nil
+}
+
+func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
+	if pgId.ToUint64() < 2 {
+		err = fmt.Errorf("read page type not is dat : %d", pgId.ToUint64())
+		return
+	}
+	cp, found := m.cache.readPage(pgId.ToUint64())
+	if found {
+		pd.parse(cp.data)
+		return
+	}
+	var buf []byte
+	buf, err = m.readRawPage(pgId, int(m.sysPageSize))
+	if err != nil {
+		return
+	}
+	pd.parse(buf)
+	if pd.checksum() != pd.Header.sum {
+		err = errors.New("page data corrupted")
+		return
+	}
+	m.cache.setReadValue(cachePage{
+		txSeq: 0,
+		data:  buf,
+		pgId:  pgId,
+	})
 	return
 }
 
-func (m *mmapPageStorage) cleanPage(pd *pageDesc) error {
-	pgId := pd.Header.PgId
-	pgRawBytes := unsafe.Slice((*byte)(unsafe.Pointer(&m.dat[pgId.ToUint64()*uint64(m.sysPageSize)])), m.sysPageSize)
-	clear(pgRawBytes)
-	return nil
+func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) error {
+	writeCount, err := m.file.WriteAt(buf, int64(pgId.ToUint64()*uint64(m.sysPageSize)))
+	if err != nil {
+		return err
+	}
+	if writeCount != len(buf) {
+		return fmt.Errorf("write %d bytes instead of expected %d", writeCount, len(buf))
+	} else {
+		return nil
+	}
 }
 
-func (m *mmapPageStorage) writePage(desc *pageDesc) error {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (m *mmapPageStorage) rangePageByPageId(u uint64, f func(desc *pageDesc) error) error {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (m *mmapPageStorage) RangePageByPageDesc(desc *pageDesc, f func(desc *pageDesc) error) error {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (m *mmapPageStorage) writeAll(pds []*pageDesc) error {
-	//TODO implement me
-	panic("implement me")
+func (m *pageStorage) deleteAllDirtyPage() {
+	m.cache.delAllDirtyPage()
+	m.freelist.cache.delAllDirtyPage()
 }
