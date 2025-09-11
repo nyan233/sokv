@@ -132,7 +132,7 @@ type BTreeDisk[K any, V any] struct {
 	c             Config
 	recordLogFile *os.File
 	txSeq         atomic.Uint64
-	logger        slog.Logger
+	logger        *slog.Logger
 }
 
 type Config struct {
@@ -141,6 +141,7 @@ type Config struct {
 	TreeM                    int
 	MaxPageCacheSize         int
 	MaxFreeListPageCacheSize int
+	Logger                   *slog.Logger
 }
 
 func NewBTreeDisk[K any, V any](c Config) *BTreeDisk[K, V] {
@@ -164,6 +165,14 @@ func (bt *BTreeDisk[K, V]) getFilePath(suffix string) string {
 func (bt *BTreeDisk[K, V]) Init() error {
 	if bt.c.TreeM > treeMaxM {
 		return fmt.Errorf("bt.m > treeMaxM(%d)", treeMaxM)
+	}
+	if bt.c.Logger == nil {
+		bt.logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			AddSource: true,
+			Level:     slog.LevelDebug,
+		}))
+	} else {
+		bt.logger = bt.c.Logger
 	}
 	bt.s = newPageStorage(bt.getFilePath(".dat"), bt.getFilePath(".freelist"), uint32(sys.GetSysPageSize()))
 	err := bt.s.init()
