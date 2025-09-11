@@ -177,6 +177,10 @@ func (tx *Tx[K, V]) doCommit() error {
 	if writeCount != 8 {
 		return fmt.Errorf("write count %d not equal 8", writeCount)
 	}
+	err = tx.recordLog.Sync()
+	if err != nil {
+		return err
+	}
 	return tx.tree.doWritePageData(tx.header)
 }
 
