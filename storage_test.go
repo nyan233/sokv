@@ -8,7 +8,7 @@ import (
 
 func TestMMapPageStorage(t *testing.T) {
 	initTest(t)
-	s := newMMapPageStorage("testdata/test.db")
+	s := newPageStorage("testdata/test.db")
 	require.NoError(t, s.init())
 	res, err := s.allocPage(16)
 	require.NoError(t, err)

@@ -24,6 +24,10 @@ func (p *pageIdPos) get() pageId {
 	return p.pg.pgIdList[p.innerIdx]
 }
 
+func (p *pageIdPos) getOfBytes() []byte {
+	return p.pg.pgIdList[p.innerIdx][:]
+}
+
 func (p *pageIdPos) setPageIdFrom(v uint64) {
 	p.pg.pgIdList[p.innerIdx].FromUint64(v)
 }
@@ -120,48 +124,48 @@ func (f *freelist) growFile() (err error) {
 	return f.file.Truncate(fileSize)
 }
 
-func (f *freelist) readPage(txSeq, pageId uint64) (p freelistPage, err error) {
+func (f *freelist) readPage(txh *txHeader, pageId uint64) (p freelistPage, err error) {
 	cp, found := f.cache.readPage(pageId)
 	if found {
 		p.parse(cp.data)
 		return
 	}
-	var (
-		buf       = make([]byte, f.sysPageSize)
-		readCount int
-	)
-	readCount, err = f.file.ReadAt(buf, int64(pageId)*int64(f.sysPageSize))
+	var buf []byte
+	buf, err = f.readRawPage(pageId)
 	if err != nil {
-		return
-	}
-	if readCount != len(buf) {
-		err = errors.New("read count not equal size")
 		return
 	}
 	p.parse(buf)
 	f.cache.setReadValue(cachePage{
-		txSeq: txSeq,
+		txSeq: txh.seq,
 		data:  p.rawBuf,
 		pgId:  createPageIdFromUint64(pageId),
 	})
 	return
 }
 
-func (f *freelist) writePage(txSeq, pageId uint64, page freelistPage) error {
+func (f *freelist) readRawPage(pageId uint64) ([]byte, error) {
+	buf := make([]byte, f.sysPageSize)
+	readCount, err := f.file.ReadAt(buf, int64(pageId)*int64(f.sysPageSize))
+	if err != nil {
+		return nil, err
+	}
+	if readCount != len(buf) {
+		err = errors.New("read count not equal size")
+		return nil, err
+	} else {
+		return buf, nil
+	}
+}
+
+func (f *freelist) writePage(txh *txHeader, pageId uint64, page freelistPage) error {
 	page.writePgIdListToRawBuf()
 	// 初始化时直接写
-	if txSeq == 0 {
-		writeCount, err := f.file.WriteAt(page.rawBuf, int64(pageId)*int64(f.sysPageSize))
-		if err != nil {
-			return err
-		}
-		if writeCount != len(page.rawBuf) {
-			return errors.New("write count not equal size")
-		}
-		return nil
+	if txh.seq == 0 {
+		return f.writeRawPage(pageId, page.rawBuf)
 	} else {
 		f.cache.setDirtyPage(cachePage{
-			txSeq: txSeq,
+			txSeq: txh.seq,
 			data:  page.rawBuf,
 			pgId:  createPageIdFromUint64(pageId),
 		})
@@ -169,14 +173,25 @@ func (f *freelist) writePage(txSeq, pageId uint64, page freelistPage) error {
 	}
 }
 
-func (f *freelist) readPageWithPgIdIdx(txSeq, idx uint64) (pos pageIdPos, err error) {
+func (f *freelist) writeRawPage(pageId uint64, buf []byte) error {
+	writeCount, err := f.file.WriteAt(buf, int64(pageId)*int64(f.sysPageSize))
+	if err != nil {
+		return err
+	}
+	if writeCount != len(buf) {
+		return errors.New("write count not equal size")
+	}
+	return nil
+}
+
+func (f *freelist) readPageWithPgIdIdx(txh *txHeader, idx uint64) (pos pageIdPos, err error) {
 	pos.globalIdx = idx
 	// 因为第一个页的第一个值是用来存储length的, 并不是真实的值, 所以需要略过
 	idx++
 	pageIdCount := f.sysPageSize / uint32(pgIdMemSize)
 	pos.pgId = idx / uint64(pageIdCount)
 	pos.innerIdx = idx % uint64(pageIdCount)
-	pos.pg, err = f.readPage(txSeq, pos.pgId)
+	pos.pg, err = f.readPage(txh, pos.pgId)
 	if err != nil {
 		return
 	}
@@ -197,14 +212,14 @@ func (f *freelist) isFull(length uint64) (bool, error) {
 	}
 }
 
-func (f *freelist) popOne(txSeq uint64) (p pageId, found bool, err error) {
-	return f.popPageId(txSeq)
+func (f *freelist) popOne(txh *txHeader) (p pageId, found bool, err error) {
+	return f.popPageId(txh)
 }
 
-func (f *freelist) pop(txSeq uint64, n int) ([]pageId, error) {
+func (f *freelist) pop(txh *txHeader, n int) ([]pageId, error) {
 	res := make([]pageId, 0, n)
 	for i := 0; i < n; i++ {
-		p, found, err := f.popPageId(txSeq)
+		p, found, err := f.popPageId(txh)
 		if err != nil {
 			return nil, err
 		}
@@ -217,12 +232,12 @@ func (f *freelist) pop(txSeq uint64, n int) ([]pageId, error) {
 	return res, nil
 }
 
-func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
+func (f *freelist) popPageId(txh *txHeader) (p pageId, found bool, err error) {
 	var (
 		firstPage freelistPage
 		pos       pageIdPos
 	)
-	firstPage, err = f.readPage(txSeq, 0)
+	firstPage, err = f.readPage(txh, 0)
 	if err != nil {
 		return
 	}
@@ -233,14 +248,23 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 		p = firstPage.pgIdList[1]
 		found = true
 		firstPage.pgIdList[0].FromUint64(0)
-		err = f.writePage(txSeq, 0, firstPage)
+		err = txh.addPageModify(pageRecord{
+			typ:  pageRecordFree,
+			pgId: createPageIdFromUint64(0),
+			off:  0,
+			dat:  append([]byte{}, firstPage.pgIdList[0][:]...),
+		})
+		if err != nil {
+			return
+		}
+		err = f.writePage(txh, 0, firstPage)
 		return
 	}
 	maxIdx := firstPage.pgIdList[0].ToUint64() - 1
 	p = firstPage.pgIdList[1]
 	found = true
 	// 定位maxIdx所在的page
-	pos, err = f.readPageWithPgIdIdx(txSeq, maxIdx)
+	pos, err = f.readPageWithPgIdIdx(txh, maxIdx)
 	if err != nil {
 		return
 	}
@@ -248,7 +272,19 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 	firstPage.pgIdList[1] = pos.get()
 	// f.length.FromUint64(maxIdx)
 	firstPage.pgIdList[0].FromUint64(maxIdx)
-	err = f.writePage(txSeq, 0, firstPage)
+	cpDat := make([]byte, pgIdMemSize*2)
+	copy(cpDat, firstPage.pgIdList[0][:])
+	copy(cpDat[pgIdMemSize:], firstPage.pgIdList[1][:])
+	err = txh.addPageModify(pageRecord{
+		typ:  pageRecordFree,
+		pgId: createPageIdFromUint64(0),
+		off:  0,
+		dat:  cpDat,
+	})
+	if err != nil {
+		return
+	}
+	err = f.writePage(txh, 0, firstPage)
 	if err != nil {
 		return
 	}
@@ -262,7 +298,7 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 			break
 		}
 		// v := f.data[idx]
-		pos, err = f.readPageWithPgIdIdx(txSeq, idx)
+		pos, err = f.readPageWithPgIdIdx(txh, idx)
 		if err != nil {
 			return
 		}
@@ -272,11 +308,11 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 		if leftSubIdx <= maxIdx && rightSubIdx <= maxIdx {
 			// leftVal := f.data[leftSubIdx]
 			// rightVal := f.data[rightSubIdx]
-			lPos, err = f.readPageWithPgIdIdx(txSeq, leftSubIdx)
+			lPos, err = f.readPageWithPgIdIdx(txh, leftSubIdx)
 			if err != nil {
 				return
 			}
-			rPos, err = f.readPageWithPgIdIdx(txSeq, rightSubIdx)
+			rPos, err = f.readPageWithPgIdIdx(txh, rightSubIdx)
 			if err != nil {
 				return
 			}
@@ -293,11 +329,29 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 					lPos.setPageId(v)
 					pos.setPageId(leftVal)
 				}
-				err = f.writePage(txSeq, pos.pgId, pos.pg)
+				err = txh.addPageModify(pageRecord{
+					typ:  pageRecordFree,
+					pgId: createPageIdFromUint64(pos.pgId),
+					off:  uint32(pos.innerIdx) * uint32(pgIdMemSize),
+					dat:  append([]byte{}, pos.getOfBytes()[:]...),
+				})
 				if err != nil {
 					return
 				}
-				err = f.writePage(txSeq, lPos.pgId, lPos.pg)
+				err = f.writePage(txh, pos.pgId, pos.pg)
+				if err != nil {
+					return
+				}
+				err = txh.addPageModify(pageRecord{
+					typ:  pageRecordFree,
+					pgId: createPageIdFromUint64(lPos.pgId),
+					off:  uint32(lPos.innerIdx) * uint32(pgIdMemSize),
+					dat:  append([]byte{}, lPos.getOfBytes()[:]...),
+				})
+				if err != nil {
+					return
+				}
+				err = f.writePage(txh, lPos.pgId, lPos.pg)
 				if err != nil {
 					return
 				}
@@ -309,11 +363,29 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 					rPos.setPageId(v)
 					pos.setPageId(rightVal)
 				}
-				err = f.writePage(txSeq, pos.pgId, pos.pg)
+				err = txh.addPageModify(pageRecord{
+					typ:  pageRecordFree,
+					pgId: createPageIdFromUint64(pos.pgId),
+					off:  uint32(pos.innerIdx) * uint32(pgIdMemSize),
+					dat:  append([]byte{}, pos.getOfBytes()[:]...),
+				})
 				if err != nil {
 					return
 				}
-				err = f.writePage(txSeq, rPos.pgId, rPos.pg)
+				err = f.writePage(txh, pos.pgId, pos.pg)
+				if err != nil {
+					return
+				}
+				err = txh.addPageModify(pageRecord{
+					typ:  pageRecordFree,
+					pgId: createPageIdFromUint64(rPos.pgId),
+					off:  uint32(rPos.innerIdx) * uint32(pgIdMemSize),
+					dat:  append([]byte{}, rPos.getOfBytes()[:]...),
+				})
+				if err != nil {
+					return
+				}
+				err = f.writePage(txh, rPos.pgId, rPos.pg)
 				if err != nil {
 					return
 				}
@@ -322,7 +394,7 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 		} else if leftSubIdx <= maxIdx {
 			// 只存在左节点
 			// leftVal := f.data[leftSubIdx]
-			lPos, err = f.readPageWithPgIdIdx(txSeq, leftSubIdx)
+			lPos, err = f.readPageWithPgIdIdx(txh, leftSubIdx)
 			if err != nil {
 				return
 			}
@@ -333,11 +405,29 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 				lPos.setPageId(v)
 				pos.setPageId(leftVal)
 			}
-			err = f.writePage(txSeq, pos.pgId, pos.pg)
+			err = txh.addPageModify(pageRecord{
+				typ:  pageRecordFree,
+				pgId: createPageIdFromUint64(pos.pgId),
+				off:  uint32(pos.innerIdx) * uint32(pgIdMemSize),
+				dat:  append([]byte{}, pos.getOfBytes()[:]...),
+			})
 			if err != nil {
 				return
 			}
-			err = f.writePage(txSeq, lPos.pgId, lPos.pg)
+			err = f.writePage(txh, pos.pgId, pos.pg)
+			if err != nil {
+				return
+			}
+			err = txh.addPageModify(pageRecord{
+				typ:  pageRecordFree,
+				pgId: createPageIdFromUint64(lPos.pgId),
+				off:  uint32(lPos.innerIdx) * uint32(pgIdMemSize),
+				dat:  append([]byte{}, lPos.getOfBytes()[:]...),
+			})
+			if err != nil {
+				return
+			}
+			err = f.writePage(txh, lPos.pgId, lPos.pg)
 			if err != nil {
 				return
 			}
@@ -350,13 +440,13 @@ func (f *freelist) popPageId(txSeq uint64) (p pageId, found bool, err error) {
 	return
 }
 
-func (f *freelist) pushOne(txSeq uint64, id pageId) error {
-	return f.pushPageId(txSeq, id)
+func (f *freelist) pushOne(txh *txHeader, id pageId) error {
+	return f.pushPageId(txh, id)
 }
 
-func (f *freelist) push(txSeq uint64, pageIdL []pageId) (err error) {
+func (f *freelist) push(txh *txHeader, pageIdL []pageId) (err error) {
 	for _, pageId := range pageIdL {
-		err = f.pushPageId(txSeq, pageId)
+		err = f.pushPageId(txh, pageId)
 		if err != nil {
 			return
 		}
@@ -364,17 +454,26 @@ func (f *freelist) push(txSeq uint64, pageIdL []pageId) (err error) {
 	return
 }
 
-func (f *freelist) pushPageId(txSeq uint64, pageId pageId) (err error) {
+func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 	var (
 		firstPage freelistPage
 		isFull    bool
 	)
-	firstPage, err = f.readPage(txSeq, 0)
+	firstPage, err = f.readPage(txh, 0)
 	if err != nil {
 		return
 	}
 	currentLength := firstPage.pgIdList[0].ToUint64()
 	firstPage.pgIdList[0].FromUint64(currentLength + 1)
+	err = txh.addPageModify(pageRecord{
+		typ:  pageRecordFree,
+		pgId: createPageIdFromUint64(0),
+		off:  0,
+		dat:  append([]byte{}, firstPage.pgIdList[0][:]...),
+	})
+	if err != nil {
+		return
+	}
 	isFull, err = f.isFull(currentLength)
 	if err != nil {
 		return
@@ -386,7 +485,16 @@ func (f *freelist) pushPageId(txSeq uint64, pageId pageId) (err error) {
 		}
 	}
 	firstPage.pgIdList[1] = pageId
-	err = f.writePage(txSeq, 0, firstPage)
+	err = txh.addPageModify(pageRecord{
+		typ:  pageRecordFree,
+		pgId: createPageIdFromUint64(0),
+		off:  uint32(pgIdMemSize),
+		dat:  append([]byte{}, firstPage.pgIdList[1][:]...),
+	})
+	if err != nil {
+		return
+	}
+	err = f.writePage(txh, 0, firstPage)
 	if err != nil {
 		return
 	}
@@ -399,11 +507,11 @@ func (f *freelist) pushPageId(txSeq uint64, pageId pageId) (err error) {
 			break
 		}
 		parentIndex := currentLength / 2
-		parentPos, err = f.readPageWithPgIdIdx(txSeq, parentIndex)
+		parentPos, err = f.readPageWithPgIdIdx(txh, parentIndex)
 		if err != nil {
 			return
 		}
-		currentPos, err = f.readPageWithPgIdIdx(txSeq, currentLength)
+		currentPos, err = f.readPageWithPgIdIdx(txh, currentLength)
 		if err != nil {
 			return
 		}
@@ -416,11 +524,29 @@ func (f *freelist) pushPageId(txSeq uint64, pageId pageId) (err error) {
 			parentPos.setPageId(currentV)
 			currentPos.setPageId(parentV)
 		}
-		err = f.writePage(txSeq, parentPos.pgId, parentPos.pg)
+		err = txh.addPageModify(pageRecord{
+			typ:  pageRecordFree,
+			pgId: createPageIdFromUint64(parentPos.pgId),
+			off:  uint32(parentPos.innerIdx) * uint32(pgIdMemSize),
+			dat:  append([]byte{}, parentPos.getOfBytes()...),
+		})
 		if err != nil {
 			return
 		}
-		err = f.writePage(txSeq, currentPos.pgId, currentPos.pg)
+		err = f.writePage(txh, parentPos.pgId, parentPos.pg)
+		if err != nil {
+			return
+		}
+		err = txh.addPageModify(pageRecord{
+			typ:  pageRecordFree,
+			pgId: createPageIdFromUint64(currentPos.pgId),
+			off:  uint32(currentPos.innerIdx) * uint32(pgIdMemSize),
+			dat:  append([]byte{}, currentPos.getOfBytes()...),
+		})
+		if err != nil {
+			return
+		}
+		err = f.writePage(txh, currentPos.pgId, currentPos.pg)
 		if err != nil {
 			return
 		}

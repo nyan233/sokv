@@ -1,14 +1,20 @@
 package sokv
 
 import (
+	"fmt"
 	cmap "github.com/zbh255/gocode/container/map"
 )
 
+type cachePage struct {
+	txSeq uint64
+	data  []byte
+	pgId  pageId
+}
+
 type pageCache struct {
-	c         map[uint64]pageDesc
+	c         map[uint64]cachePage
 	useCount  *cmap.BTreeMap[uint64, *[]uint64]
-	dirtyPage *cmap.BTreeMap[uint64, pageDesc]
-	s         *mmapPageStorage
+	dirtyPage *cmap.BTreeMap[uint64, cachePage]
 }
 
 func newPageCache(maxPage int) *pageCache {
@@ -16,34 +22,45 @@ func newPageCache(maxPage int) *pageCache {
 		panic("maxPage must be a multiple of 64")
 	}
 	return &pageCache{
-		c:        make(map[uint64]pageDesc, maxPage),
+		c:        make(map[uint64]cachePage, maxPage),
 		useCount: cmap.NewBtreeMap[uint64, *[]uint64](64),
 	}
 }
 
-func (cache *pageCache) read(pgId uint64) (pageDesc, bool, error) {
-	dirtyPage, ok := cache.dirtyPage.LoadOk(pgId)
+func (cache *pageCache) readPage(pgId uint64) (cachePage, bool) {
+	pd, ok := cache.c[pgId]
 	if ok {
-		return dirtyPage, ok, nil
+		return pd, ok
 	}
-	cachePage, ok := cache.c[pgId]
-	if ok {
-		return cachePage, ok, nil
-	}
-	cache.s.readPage(createPageIdFromUint64(pgId))
+	return cache.dirtyPage.LoadOk(pgId)
 }
 
-// 每个写必须关联一个事务
-func (cache *pageCache) write(desc pageDesc) {
-	if cache.dirtyPage == nil {
-		cache.dirtyPage = cmap.NewBtreeMap[uint64, pageDesc](32)
+func (cache *pageCache) setReadValue(pd cachePage) {
+	pgId := pd.pgId.ToUint64()
+	_, ok := cache.c[pgId]
+	if ok {
+		panic(fmt.Errorf("dup set cache value : %d", pgId))
 	}
-	cache.dirtyPage.StoreOk(desc.Header.PgId.ToUint64(), desc)
+	cache.c[pd.pgId.ToUint64()] = pd
 }
 
-func (cache *pageCache) flushAllDirtyPage() error {
-	cache.dirtyPage.Range(0, func(key uint64, val pageDesc) bool {
+func (cache *pageCache) setDirtyPage(pd cachePage) bool {
+	pgId := pd.pgId.ToUint64()
+	delete(cache.c, pgId)
+	return cache.dirtyPage.StoreOk(pgId, pd)
+}
+
+func (cache *pageCache) rangeAndClearDirtyPage(fn func(pgId uint64, pd cachePage) bool) {
+	cache.dirtyPage.Range(cache.dirtyPage.MinKey(), fn)
+	cache.dirtyPage = nil
+}
+
+func (cache *pageCache) delAllDirtyPage() {
+	cache.rangeAndClearDirtyPage(func(pgId uint64, pd cachePage) bool {
+		_, ok := cache.c[pgId]
+		if ok {
+			delete(cache.c, pgId)
+		}
 		return true
 	})
-	return nil
 }
