@@ -150,33 +150,45 @@ func createPageIdFromUint64(v uint64) (p pageId) {
 	return
 }
 
-type pageStorage struct {
-	file         *os.File
-	datPath      string
-	freelistPath string
-	pageSize     uint32
-	freelist     *freelist
-	cache        *pageCache
+type pageStorageOption struct {
+	DataPath             string
+	FreelistPath         string
+	PageSize             uint32
+	MaxCacheSize         int
+	FreelistMaxCacheSize int
 }
 
-func newPageStorage(datPath, freelistPath string, sysPageSize uint32) *pageStorage {
+type pageStorage struct {
+	file     *os.File
+	opt      *pageStorageOption
+	freelist *freelist
+	cache    *pageCache
+}
+
+func newPageStorage(opt *pageStorageOption) *pageStorage {
+	// page缓存不能关闭
+	if opt.MaxCacheSize == 0 {
+		panic("MaxCacheSize equal zero")
+	}
+	if opt.FreelistMaxCacheSize == 0 {
+		panic("FreelistMaxCacheSize equal zero")
+	}
 	return &pageStorage{
-		datPath:      datPath,
-		freelistPath: freelistPath,
-		pageSize:     sysPageSize,
+		opt:   opt,
+		cache: newPageCache(opt.MaxCacheSize),
 	}
 }
 
 func (m *pageStorage) getPageSize() uint32 {
-	return m.pageSize
+	return m.opt.PageSize
 }
 
 func (m *pageStorage) init() (err error) {
-	m.file, err = sys.OpenFile(m.datPath)
+	m.file, err = sys.OpenFile(m.opt.DataPath)
 	if err != nil {
 		return
 	}
-	m.pageSize = uint32(sys.GetSysPageSize())
+	m.opt.PageSize = uint32(sys.GetSysPageSize())
 	var fileSize uint64
 	stat, err := m.file.Stat()
 	if err != nil {
@@ -192,13 +204,13 @@ func (m *pageStorage) init() (err error) {
 	if err != nil {
 		return
 	}
-	m.pageSize = md.header.pageSize
-	m.freelist = newFreelist(m.freelistPath, m.pageSize)
+	m.opt.PageSize = md.header.pageSize
+	m.freelist = newFreelist(m.opt)
 	return m.freelist.init()
 }
 
 func (m *pageStorage) initFile() (err error) {
-	defaultSize := uint64(m.pageSize) * defaultPageCount
+	defaultSize := uint64(m.opt.PageSize) * defaultPageCount
 	err = m.file.Truncate(int64(defaultSize))
 	if err != nil {
 		return err
@@ -210,9 +222,9 @@ func (m *pageStorage) initFile() (err error) {
 		return
 	}
 	md.header.header = medataHeader
-	md.header.pageSize = m.pageSize
+	md.header.pageSize = m.opt.PageSize
 	// init freelist
-	m.freelist = newFreelist(m.datPath+".freelist", m.pageSize)
+	m.freelist = newFreelist(m.opt)
 	err = m.freelist.init()
 	if err != nil {
 		return
@@ -248,7 +260,7 @@ func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
 	md.parse(rawPage)
 	var byteLen int
 	if isInit {
-		byteLen = int(m.pageSize)
+		byteLen = int(m.opt.PageSize)
 	} else {
 		byteLen = int(md.header.pageSize)
 		if md.checksum() != md.header.sum {
@@ -257,7 +269,7 @@ func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
 		}
 	}
 	if byteLen != len(rawPage) {
-		m.pageSize = md.header.pageSize
+		m.opt.PageSize = md.header.pageSize
 		rawPage, err = m.readRawPage(createPageIdFromUint64(0))
 		if err != nil {
 			return md, err
@@ -287,8 +299,8 @@ func (m *pageStorage) grow() (err error) {
 	if err != nil {
 		return err
 	}
-	freePageStart := fileSize / int64(m.pageSize)
-	freePageEnd := newFileSize / int64(m.pageSize)
+	freePageStart := fileSize / int64(m.opt.PageSize)
+	freePageEnd := newFileSize / int64(m.opt.PageSize)
 	for i := freePageStart; i < freePageEnd; i++ {
 		err = m.freelist.pushOne(&txHeader{seq: 0}, createPageIdFromUint64(uint64(i)))
 		if err != nil {
@@ -344,7 +356,7 @@ func (m *pageStorage) setLocalData(b []byte) error {
 	if err != nil {
 		return err
 	}
-	maxSize := int(m.pageSize - md.minSize())
+	maxSize := int(m.opt.PageSize - md.minSize())
 	if len(b) > maxSize {
 		return fmt.Errorf("data too large : len(b) == %d > maxSize(%d)", len(b), maxSize)
 	}
@@ -426,13 +438,13 @@ func (m *pageStorage) freePage(txh *txHeader, pgIdList []pageId) error {
 }
 
 func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
-	buf := make([]byte, m.pageSize)
-	readCount, err := m.file.ReadAt(buf, int64(pgId.ToUint64()*uint64(m.pageSize)))
+	buf := make([]byte, m.opt.PageSize)
+	readCount, err := m.file.ReadAt(buf, int64(pgId.ToUint64()*uint64(m.opt.PageSize)))
 	if err != nil {
 		return nil, err
 	}
-	if readCount != int(m.pageSize) {
-		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, m.pageSize)
+	if readCount != int(m.opt.PageSize) {
+		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, m.opt.PageSize)
 	}
 	return buf, nil
 }
@@ -466,7 +478,7 @@ func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
 }
 
 func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) error {
-	writeCount, err := m.file.WriteAt(buf, int64(pgId.ToUint64()*uint64(m.pageSize)))
+	writeCount, err := m.file.WriteAt(buf, int64(pgId.ToUint64()*uint64(m.opt.PageSize)))
 	if err != nil {
 		return err
 	}

@@ -64,21 +64,19 @@ func (p *freelistPage) writePgIdListToRawBuf() {
 }
 
 type freelist struct {
-	file        *os.File
-	path        string
-	sysPageSize uint32
-	cache       *pageCache
+	file  *os.File
+	opt   *pageStorageOption
+	cache *pageCache
 }
 
-func newFreelist(path string, sysPageSize uint32) *freelist {
+func newFreelist(opt *pageStorageOption) *freelist {
 	return &freelist{
-		path:        path,
-		sysPageSize: sysPageSize,
+		opt: opt,
 	}
 }
 
 func (f *freelist) init() (err error) {
-	f.file, err = sys.OpenFile(f.path)
+	f.file, err = sys.OpenFile(f.opt.FreelistPath)
 	if err != nil {
 		return
 	}
@@ -145,8 +143,8 @@ func (f *freelist) readPage(txh *txHeader, pageId uint64) (p freelistPage, err e
 }
 
 func (f *freelist) readRawPage(pageId uint64) ([]byte, error) {
-	buf := make([]byte, f.sysPageSize)
-	readCount, err := f.file.ReadAt(buf, int64(pageId)*int64(f.sysPageSize))
+	buf := make([]byte, f.opt.PageSize)
+	readCount, err := f.file.ReadAt(buf, int64(pageId)*int64(f.opt.PageSize))
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +172,7 @@ func (f *freelist) writePage(txh *txHeader, pageId uint64, page freelistPage) er
 }
 
 func (f *freelist) writeRawPage(pageId uint64, buf []byte) error {
-	writeCount, err := f.file.WriteAt(buf, int64(pageId)*int64(f.sysPageSize))
+	writeCount, err := f.file.WriteAt(buf, int64(pageId)*int64(f.opt.PageSize))
 	if err != nil {
 		return err
 	}
@@ -188,7 +186,7 @@ func (f *freelist) readPageWithPgIdIdx(txh *txHeader, idx uint64) (pos pageIdPos
 	pos.globalIdx = idx
 	// 因为第一个页的第一个值是用来存储length的, 并不是真实的值, 所以需要略过
 	idx++
-	pageIdCount := f.sysPageSize / uint32(pgIdMemSize)
+	pageIdCount := f.opt.PageSize / uint32(pgIdMemSize)
 	pos.pgId = idx / uint64(pageIdCount)
 	pos.innerIdx = idx % uint64(pageIdCount)
 	pos.pg, err = f.readPage(txh, pos.pgId)
@@ -199,13 +197,13 @@ func (f *freelist) readPageWithPgIdIdx(txh *txHeader, idx uint64) (pos pageIdPos
 }
 
 func (f *freelist) isFull(length uint64) (bool, error) {
-	pageIdCount := uint64(f.sysPageSize / uint32(pgIdMemSize))
+	pageIdCount := uint64(f.opt.PageSize / uint32(pgIdMemSize))
 	requirePage := length / pageIdCount
 	stat, err := f.file.Stat()
 	if err != nil {
 		return false, err
 	}
-	if int64(requirePage*uint64(f.sysPageSize)) > stat.Size() {
+	if int64(requirePage*uint64(f.opt.PageSize)) > stat.Size() {
 		return true, nil
 	} else {
 		return false, nil

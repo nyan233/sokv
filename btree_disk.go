@@ -174,7 +174,13 @@ func (bt *BTreeDisk[K, V]) Init() error {
 	} else {
 		bt.logger = bt.c.Logger
 	}
-	bt.s = newPageStorage(bt.getFilePath(".dat"), bt.getFilePath(".freelist"), uint32(sys.GetSysPageSize()))
+	bt.s = newPageStorage(&pageStorageOption{
+		DataPath:             bt.getFilePath(".dat"),
+		FreelistPath:         bt.getFilePath(".freelist"),
+		PageSize:             uint32(sys.GetSysPageSize()),
+		MaxCacheSize:         bt.c.MaxPageCacheSize,
+		FreelistMaxCacheSize: bt.c.MaxFreeListPageCacheSize,
+	})
 	err := bt.s.init()
 	if err != nil {
 		return err
