@@ -12,14 +12,14 @@ import (
 )
 
 const (
-	defaultPageCount = 256 * 1024 * 16
-	pgIdMemSize      = unsafe.Sizeof(pageRecord{})
+	defaultPageCount = 256
+	pgIdMemSize      = unsafe.Sizeof(pageId{})
 )
 
 const (
-	PageHeaderMetadata uint8 = iota + 1
-	PageHeaderFreeList
-	PageHeaderDat
+	pageHeaderMetadata uint8 = iota + 1
+	pageHeaderFreeList
+	pageHeaderDat
 )
 
 var (
@@ -41,7 +41,8 @@ type metadata struct {
 }
 
 func (m *metadata) minSize() uint32 {
-	return uint32(unsafe.Sizeof(metaHeader{}))
+	// return uint32(unsafe.Sizeof(metaHeader{}))
+	return 4 + 4 + 4 + uint32(pgIdMemSize) + 2
 }
 
 func (m *metadata) checksum() uint32 {
@@ -90,7 +91,8 @@ type pageDesc struct {
 }
 
 func (p *pageDesc) minSize() uint32 {
-	return uint32(unsafe.Sizeof(pageHeader{}))
+	// return uint32(unsafe.Sizeof(pageHeader{}))
+	return uint32(1 + 4 + pgIdMemSize + 8 + pgIdMemSize)
 }
 
 // SetFlags NOTE: 注意, 如果这个页头是由mmap分配, 那么这个改动将刷新到磁盘, 将刷新到磁盘, 将刷新到磁盘, 重要的事情说三遍
@@ -235,13 +237,11 @@ func (m *pageStorage) initFile() (err error) {
 	if err != nil {
 		return
 	}
+	pgIdList := make([]pageId, 0, defaultPageCount-3)
 	for i := 3; i < defaultPageCount; i++ {
-		err = m.freelist.pushOne(&txHeader{seq: 0}, createPageIdFromUint64(uint64(i)))
-		if err != nil {
-			return
-		}
+		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
 	}
-	return
+	return m.freelist.initPageIdList(&txHeader{seq: 0}, pgIdList)
 }
 
 func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
@@ -278,7 +278,7 @@ func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
 	}
 	m.cache.setReadValue(cachePage{
 		txSeq: 0,
-		data:  md.data,
+		data:  md.rawBuf,
 		pgId:  createPageIdFromUint64(0),
 	})
 	return md, nil
@@ -319,16 +319,18 @@ func (m *pageStorage) close() (err error) {
 	return
 }
 
-func (m *pageStorage) readRootPage() (pd pageDesc, err error) {
-	md, err := m.getMetadata(false)
+func (m *pageStorage) readRootPage() (pgId pageId, err error) {
+	var md metadata
+	md, err = m.getMetadata(false)
 	if err != nil {
-		return pd, err
+		return
+	} else {
+		return md.header.rootNodePgId, nil
 	}
-	return m.readPage(md.header.rootNodePgId)
 }
 
-func (m *pageStorage) setRootPage(txh *txHeader, pd pageDesc) error {
-	return m.setRootPageWithPageId(txh, pd.Header.PgId)
+func (m *pageStorage) setRootPage(txh *txHeader, pgId pageId) error {
+	return m.setRootPageWithPageId(txh, pgId)
 }
 
 func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) error {
@@ -364,7 +366,7 @@ func (m *pageStorage) setLocalData(b []byte) error {
 	copy(md.data, b)
 	md.writeHeader2RawBuf()
 	pgId := createPageIdFromUint64(0)
-	m.cache.setReadValue(cachePage{
+	m.cache.setDirtyPage(cachePage{
 		txSeq: 0,
 		data:  md.rawBuf,
 		pgId:  pgId,
@@ -465,9 +467,11 @@ func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
 		return
 	}
 	pd.parse(buf)
-	if pd.checksum() != pd.Header.sum {
-		err = errors.New("page data corrupted")
-		return
+	if !bytesIsZero(pd.rawBuf) {
+		if pd.checksum() != pd.Header.sum {
+			err = errors.New("page data corrupted")
+			return
+		}
 	}
 	m.cache.setReadValue(cachePage{
 		txSeq: 0,

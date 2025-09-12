@@ -1,3 +1,5 @@
+//go:build windows
+
 package sys
 
 import (
@@ -191,4 +193,31 @@ func MemLock(dat []byte) (err error) {
 
 func MemUnlock(dat []byte) (err error) {
 	return nil
+}
+
+func OpenFile(path string) (file *os.File, err error) {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// 打开文件，设置 Windows 特定的标志
+	// FILE_FLAG_NO_BUFFERING: 禁用缓存
+	// FILE_FLAG_WRITE_THROUGH: 直接写入磁盘
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ|windows.GENERIC_WRITE, // 读写权限
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,                   // 默认安全属性
+		windows.CREATE_ALWAYS, // 等价于 os.O_CREATE|os.O_TRUNC
+		windows.FILE_FLAG_NO_BUFFERING|windows.FILE_FLAG_WRITE_THROUGH,
+		0, // 无模板文件
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// 将 syscall.Handle 转换为 os.File
+	file = os.NewFile(uintptr(handle), path)
+	return file, nil
 }

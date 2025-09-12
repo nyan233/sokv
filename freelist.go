@@ -6,11 +6,7 @@ import (
 	"fmt"
 	"github.com/nyan233/sokv/internal/sys"
 	"os"
-	"unsafe"
-)
-
-var (
-	defaultFreelistHeapByteSize = unsafe.Sizeof(pageId{}) * 4096
+	"slices"
 )
 
 type pageIdPos struct {
@@ -59,7 +55,7 @@ func (p *freelistPage) writePgIdListToRawBuf() {
 		panic(fmt.Errorf("pageIdList byte size overflow of pageSize(%d)", len(p.rawBuf)))
 	}
 	for i := 0; i < len(p.pgIdList); i++ {
-		copy(p.rawBuf[i:i*int(pgIdMemSize)], p.pgIdList[i][:])
+		copy(p.rawBuf[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], p.pgIdList[i][:])
 	}
 }
 
@@ -71,7 +67,8 @@ type freelist struct {
 
 func newFreelist(opt *pageStorageOption) *freelist {
 	return &freelist{
-		opt: opt,
+		opt:   opt,
+		cache: newPageCache(opt.FreelistMaxCacheSize),
 	}
 }
 
@@ -103,7 +100,7 @@ func (f *freelist) close() (err error) {
 }
 
 func (f *freelist) initFile() (err error) {
-	return f.file.Truncate(int64(defaultFreelistHeapByteSize))
+	return f.file.Truncate(int64(f.opt.PageSize * 2))
 }
 
 func (f *freelist) growFile() (err error) {
@@ -120,6 +117,52 @@ func (f *freelist) growFile() (err error) {
 		fileSize *= 2
 	}
 	return f.file.Truncate(fileSize)
+}
+
+// 堆是一颗完全二叉树, 有序的pgIdList初始化时可以直接插入, 减少磁盘写的次数, 增加ssd的寿命
+func (f *freelist) initPageIdList(txh *txHeader, pgIdList []pageId) (err error) {
+	isSorted := slices.IsSortedFunc(pgIdList, func(a, b pageId) int {
+		return cmp.Compare(a.ToUint64(), b.ToUint64())
+	})
+	if !isSorted {
+		return fmt.Errorf("pgIdList not sorted")
+	}
+	// 分组写入
+	var (
+		idx         int
+		pageIdCount = f.opt.PageSize / uint32(pgIdMemSize)
+		page        freelistPage
+	)
+	for len(pgIdList) > 0 {
+		page, err = f.readPage(txh, uint64(idx))
+		if err != nil {
+			return
+		}
+		maxWrite := pageIdCount
+		if idx == 0 {
+			maxWrite--
+		}
+		if int(maxWrite) > len(pgIdList) {
+			maxWrite = uint32(len(pgIdList))
+		}
+		if idx == 0 {
+			page.pgIdList[0] = createPageIdFromUint64(uint64(len(pgIdList)))
+			for i := 0; i < int(maxWrite); i++ {
+				page.pgIdList[i+1] = pgIdList[i]
+			}
+		} else {
+			for i := 0; i < int(maxWrite); i++ {
+				page.pgIdList[i] = pgIdList[i]
+			}
+		}
+		err = f.writePage(txh, uint64(idx), page)
+		if err != nil {
+			return err
+		}
+		pgIdList = pgIdList[maxWrite:]
+		idx++
+	}
+	return nil
 }
 
 func (f *freelist) readPage(txh *txHeader, pageId uint64) (p freelistPage, err error) {
@@ -158,15 +201,15 @@ func (f *freelist) readRawPage(pageId uint64) ([]byte, error) {
 
 func (f *freelist) writePage(txh *txHeader, pageId uint64, page freelistPage) error {
 	page.writePgIdListToRawBuf()
-	// 初始化时直接写
+	// 初始化时直接写并设置脏页
+	f.cache.setDirtyPage(cachePage{
+		txSeq: txh.seq,
+		data:  page.rawBuf,
+		pgId:  createPageIdFromUint64(pageId),
+	})
 	if txh.seq == 0 {
 		return f.writeRawPage(pageId, page.rawBuf)
 	} else {
-		f.cache.setDirtyPage(cachePage{
-			txSeq: txh.seq,
-			data:  page.rawBuf,
-			pgId:  createPageIdFromUint64(pageId),
-		})
 		return nil
 	}
 }
@@ -326,6 +369,11 @@ func (f *freelist) popPageId(txh *txHeader) (p pageId, found bool, err error) {
 					// f.data[idx] = leftVal
 					lPos.setPageId(v)
 					pos.setPageId(leftVal)
+					// 都是同一个pg, pg不是指针类型, 为了避免互相覆盖, 都同步一下修改
+					if lPos.pgId == pos.pgId {
+						lPos.pg.pgIdList[pos.innerIdx] = leftVal
+						pos.pg.pgIdList[lPos.innerIdx] = v
+					}
 				}
 				err = txh.addPageModify(pageRecord{
 					typ:  pageRecordFree,
@@ -360,6 +408,11 @@ func (f *freelist) popPageId(txh *txHeader) (p pageId, found bool, err error) {
 					//f.data[idx] = rightVal
 					rPos.setPageId(v)
 					pos.setPageId(rightVal)
+					// 都是同一个pg, pg不是指针类型, 为了避免互相覆盖, 都同步一下修改
+					if rPos.pgId == pos.pgId {
+						rPos.pg.pgIdList[pos.innerIdx] = rightVal
+						pos.pg.pgIdList[rPos.innerIdx] = v
+					}
 				}
 				err = txh.addPageModify(pageRecord{
 					typ:  pageRecordFree,
@@ -402,6 +455,11 @@ func (f *freelist) popPageId(txh *txHeader) (p pageId, found bool, err error) {
 				// f.data[idx] = leftVal
 				lPos.setPageId(v)
 				pos.setPageId(leftVal)
+				// 都是同一个pg, pg不是指针类型, 为了避免互相覆盖, 都同步一下修改
+				if lPos.pgId == pos.pgId {
+					lPos.pg.pgIdList[pos.innerIdx] = leftVal
+					pos.pg.pgIdList[lPos.innerIdx] = v
+				}
 			}
 			err = txh.addPageModify(pageRecord{
 				typ:  pageRecordFree,
@@ -452,6 +510,14 @@ func (f *freelist) push(txh *txHeader, pageIdL []pageId) (err error) {
 	return
 }
 
+func (f *freelist) addPageModify(txh *txHeader, r pageRecord) error {
+	if txh.seq == 0 {
+		return nil
+	} else {
+		return txh.addPageModify(r)
+	}
+}
+
 func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 	var (
 		firstPage freelistPage
@@ -463,7 +529,7 @@ func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 	}
 	currentLength := firstPage.pgIdList[0].ToUint64()
 	firstPage.pgIdList[0].FromUint64(currentLength + 1)
-	err = txh.addPageModify(pageRecord{
+	err = f.addPageModify(txh, pageRecord{
 		typ:  pageRecordFree,
 		pgId: createPageIdFromUint64(0),
 		off:  0,
@@ -471,6 +537,24 @@ func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 	})
 	if err != nil {
 		return
+	}
+	if currentLength == 0 {
+		firstPage.pgIdList[1] = pageId
+		err = f.addPageModify(txh, pageRecord{
+			typ:  pageRecordFree,
+			pgId: createPageIdFromUint64(0),
+			off:  uint32(pgIdMemSize),
+			dat:  append([]byte{}, firstPage.pgIdList[1][:]...),
+		})
+		if err != nil {
+			return
+		}
+		return f.writePage(txh, 0, firstPage)
+	} else {
+		err = f.writePage(txh, 0, firstPage)
+		if err != nil {
+			return
+		}
 	}
 	isFull, err = f.isFull(currentLength)
 	if err != nil {
@@ -482,17 +566,12 @@ func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 			return
 		}
 	}
-	firstPage.pgIdList[1] = pageId
-	err = txh.addPageModify(pageRecord{
-		typ:  pageRecordFree,
-		pgId: createPageIdFromUint64(0),
-		off:  uint32(pgIdMemSize),
-		dat:  append([]byte{}, firstPage.pgIdList[1][:]...),
-	})
+	pos, err := f.readPageWithPgIdIdx(txh, currentLength)
 	if err != nil {
 		return
 	}
-	err = f.writePage(txh, 0, firstPage)
+	pos.setPageId(pageId)
+	err = f.writePage(txh, pos.pgId, pos.pg)
 	if err != nil {
 		return
 	}
@@ -521,32 +600,37 @@ func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 			//f.data[currentLength] = parentV
 			parentPos.setPageId(currentV)
 			currentPos.setPageId(parentV)
-		}
-		err = txh.addPageModify(pageRecord{
-			typ:  pageRecordFree,
-			pgId: createPageIdFromUint64(parentPos.pgId),
-			off:  uint32(parentPos.innerIdx) * uint32(pgIdMemSize),
-			dat:  append([]byte{}, parentPos.getOfBytes()...),
-		})
-		if err != nil {
-			return
-		}
-		err = f.writePage(txh, parentPos.pgId, parentPos.pg)
-		if err != nil {
-			return
-		}
-		err = txh.addPageModify(pageRecord{
-			typ:  pageRecordFree,
-			pgId: createPageIdFromUint64(currentPos.pgId),
-			off:  uint32(currentPos.innerIdx) * uint32(pgIdMemSize),
-			dat:  append([]byte{}, currentPos.getOfBytes()...),
-		})
-		if err != nil {
-			return
-		}
-		err = f.writePage(txh, currentPos.pgId, currentPos.pg)
-		if err != nil {
-			return
+			// 都是同一个pg, pg不是指针类型, 为了避免互相覆盖, 都同步一下修改
+			if parentPos.pgId == currentPos.pgId {
+				parentPos.pg.pgIdList[currentPos.innerIdx] = parentV
+				currentPos.pg.pgIdList[parentPos.innerIdx] = currentV
+			}
+			err = f.addPageModify(txh, pageRecord{
+				typ:  pageRecordFree,
+				pgId: createPageIdFromUint64(parentPos.pgId),
+				off:  uint32(parentPos.innerIdx) * uint32(pgIdMemSize),
+				dat:  append([]byte{}, parentPos.getOfBytes()...),
+			})
+			if err != nil {
+				return
+			}
+			err = f.writePage(txh, parentPos.pgId, parentPos.pg)
+			if err != nil {
+				return
+			}
+			err = f.addPageModify(txh, pageRecord{
+				typ:  pageRecordFree,
+				pgId: createPageIdFromUint64(currentPos.pgId),
+				off:  uint32(currentPos.innerIdx) * uint32(pgIdMemSize),
+				dat:  append([]byte{}, currentPos.getOfBytes()...),
+			})
+			if err != nil {
+				return
+			}
+			err = f.writePage(txh, currentPos.pgId, currentPos.pg)
+			if err != nil {
+				return
+			}
 		}
 		currentLength = parentIndex
 	}

@@ -22,17 +22,19 @@ func newPageCache(maxPage int) *pageCache {
 		panic("maxPage must be a multiple of 64")
 	}
 	return &pageCache{
-		c:        make(map[uint64]cachePage, maxPage),
-		useCount: cmap.NewBtreeMap[uint64, *[]uint64](64),
+		c:         make(map[uint64]cachePage, maxPage),
+		useCount:  cmap.NewBtreeMap[uint64, *[]uint64](64),
+		dirtyPage: cmap.NewBtreeMap[uint64, cachePage](64),
 	}
 }
 
 func (cache *pageCache) readPage(pgId uint64) (cachePage, bool) {
-	pd, ok := cache.c[pgId]
+	pd, ok := cache.dirtyPage.LoadOk(pgId)
 	if ok {
 		return pd, ok
 	}
-	return cache.dirtyPage.LoadOk(pgId)
+	pd, ok = cache.c[pgId]
+	return pd, ok
 }
 
 func (cache *pageCache) setReadValue(pd cachePage) {
@@ -52,7 +54,7 @@ func (cache *pageCache) setDirtyPage(pd cachePage) bool {
 
 func (cache *pageCache) rangeAndClearDirtyPage(fn func(pgId uint64, pd cachePage) bool) {
 	cache.dirtyPage.Range(cache.dirtyPage.MinKey(), fn)
-	cache.dirtyPage = nil
+	cache.dirtyPage = cmap.NewBtreeMap[uint64, cachePage](64)
 }
 
 func (cache *pageCache) delAllDirtyPage() {

@@ -78,6 +78,10 @@ type Tx[K any, V any] struct {
 	recordLog *os.File
 }
 
+func (tx *Tx[K, V]) isReadOnly() bool {
+	return tx.header.isRead
+}
+
 func (tx *Tx[K, V]) begin() error {
 	if tx.header.isRead {
 		tx.tree.rw.RLock()
@@ -201,6 +205,9 @@ func (tx *Tx[K, V]) Get(key K) (value V, found bool, err error) {
 	}
 	valBytes, found, err = tx.tree.get(tx, keyBytes)
 	if err != nil {
+		return
+	}
+	if !found {
 		return
 	}
 	err = tx.tree.valCodec.Unmarshal(valBytes, &value)

@@ -65,7 +65,6 @@ type keywordDisk struct {
 }
 
 type nodeDiskDesc struct {
-	pd       pageDesc
 	pageLink []pageDesc
 	subNodes []pageId
 	// 布局的描述, 不在磁盘上存储
@@ -77,7 +76,7 @@ type nodeDiskDesc struct {
 func (node *nodeDiskDesc) sumKeywordDiskOff(idx int) (off uint32) {
 	for i := 0; i < idx; i++ {
 		off += 8
-		off += node.keywordsPageView[idx].keyLen + node.keywordsPageView[idx].valLen
+		off += node.keywordsPageView[i].keyLen + node.keywordsPageView[i].valLen
 	}
 	return
 }
@@ -294,6 +293,7 @@ func (bt *BTreeDisk[K, V]) crashRecovery(recordLog *os.File) error {
 	return bt.doWritePageData(txh)
 }
 
+// NOTE : 这里不需要处理扩容, 写脏页时底层文件已经扩容了, 如果这里会触发io.EOF说明文件大小不正确, 这可能是代码的Bug或者底层文件系统的Bug
 func (bt *BTreeDisk[K, V]) doWritePageData(txh *txHeader) error {
 	for pgId, changeList := range txh.storagePageChangeRecord {
 		rawPage, err := bt.s.readRawPage(createPageIdFromUint64(pgId))
@@ -321,10 +321,11 @@ func (bt *BTreeDisk[K, V]) doWritePageData(txh *txHeader) error {
 			return err
 		}
 	}
+	bt.s.deleteAllDirtyPage()
 	return nil
 }
 
-func (bt *BTreeDisk[K, V]) OpenReadTx(logic func(tx *Tx[K, V]) error) (err error) {
+func (bt *BTreeDisk[K, V]) OpenOnlyReadTx(logic func(tx *Tx[K, V]) error) (err error) {
 	tx := &Tx[K, V]{
 		header: &txHeader{
 			seq:        bt.txSeq.Load(),
@@ -377,17 +378,40 @@ func (bt *BTreeDisk[K, V]) rollbackDirtyPage() {
 	bt.s.deleteAllDirtyPage()
 }
 
-func (bt *BTreeDisk[K, V]) loadRootNode() (d *nodeDiskDesc, err error) {
-	var pd pageDesc
-	pd, err = bt.s.readRootPage()
+func (bt *BTreeDisk[K, V]) loadRootNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) {
+	var (
+		pd   pageDesc
+		pgId pageId
+	)
+	pgId, err = bt.s.readRootPage()
 	if err != nil {
 		return
 	}
-	return bt.loadNode(pd)
+	pd, err = bt.s.readPage(pgId)
+	if err != nil {
+		return
+	}
+	pd.TxSeq = bt.txSeq.Load()
+	if bytesIsZero(pd.rawBuf) {
+		pd.Header = pageHeader{
+			Header: pageHeaderDat,
+			PgId:   pgId,
+			Flags:  0,
+		}
+		// 写事务的话写一下数据到脏页, 只读事务就算了
+		if !tx.isReadOnly() {
+			err = bt.s.writePage(tx.header, pd)
+			if err != nil {
+				return
+			}
+		}
+	}
+	return bt.loadNode(tx, pd)
 }
 
-func (bt *BTreeDisk[K, V]) loadNode(pd pageDesc) (d *nodeDiskDesc, err error) {
-	if pd.Header.Header != PageHeaderDat {
+func (bt *BTreeDisk[K, V]) loadNode(tx *Tx[K, V], pd pageDesc) (d *nodeDiskDesc, err error) {
+	// 新的数据页, 初始化一下
+	if pd.Header.Header != pageHeaderDat {
 		err = fmt.Errorf("node type must is dat : %+v", pd.Header)
 		return
 	}
@@ -398,12 +422,11 @@ func (bt *BTreeDisk[K, V]) loadNode(pd pageDesc) (d *nodeDiskDesc, err error) {
 		buf     bytes.Buffer
 	)
 	d = new(nodeDiskDesc)
-	d.pd = pd
 	d.subNodes = make([]pageId, bt.c.TreeM)
 	for i := 0; i < bt.c.TreeM; i++ {
-		d.subNodes[i] = pageId(d.pd.Data[i*6 : (i+1)*6])
+		d.subNodes[i] = pageId(curPd.Data[i*6 : (i+1)*6])
 	}
-	keywordLen := d.pd.Header.Flags & uint64(math.MaxUint16)
+	keywordLen := curPd.Header.Flags & uint64(math.MaxUint16)
 	// TODO : 后台页整理, 有些页可能原来有很多溢出页, 但之后因为调整/删除各种原因数据变少之后这些不用的溢出页需要释放
 	for {
 		buf.Write(curPd.Data[readOff:])
@@ -425,70 +448,20 @@ func (bt *BTreeDisk[K, V]) loadNode(pd pageDesc) (d *nodeDiskDesc, err error) {
 		d.keywordsPageView = append(d.keywordsPageView, kw)
 		d.memKeywords = append(d.memKeywords, keywordDisk{
 			key: b[:kw.keyLen],
-			val: b[kw.valLen : kw.keyLen+kw.valLen],
+			val: b[kw.keyLen : kw.keyLen+kw.valLen],
 		})
 		b = b[kw.keyLen+kw.valLen:]
 	}
-	//for i := 0; i < bt.m; i++ {
-	//	if off1+8 >= uintptr(len(curPd.Data)) {
-	//		if !(curPd.Header.Overflow.ToUint64() > 0) {
-	//			break
-	//		}
-	//		curPd, err = bt.s.readPage(curPd.Header.Overflow)
-	//		if err != nil {
-	//			return
-	//		}
-	//		off1 = 0
-	//	}
-	//	var (
-	//		buf []byte
-	//		kw  = (*keywordDiskDesc)(unsafe.Pointer(&curPd.Data[off1]))
-	//	)
-	//	off1 += 8
-	//	if kw.keyLen == 0 && kw.valLen == 0 {
-	//		break
-	//	}
-	//	buf = make([]byte, 0, kw.keyLen+kw.valLen)
-	//	readCount := uintptr(kw.keyLen + kw.valLen)
-	//	for readCount == 0 {
-	//		oneMaxRead := readCount
-	//		if off1+oneMaxRead >= uintptr(len(curPd.Data)) {
-	//			oneMaxRead = uintptr(len(curPd.Data)) - off1
-	//		}
-	//		bufOldLen := uintptr(len(buf))
-	//		buf = buf[:bufOldLen+oneMaxRead]
-	//		copy(buf[bufOldLen:], curPd.Data[off1:off1+oneMaxRead])
-	//		readCount -= oneMaxRead
-	//		off1 += oneMaxRead
-	//		if off1 == uintptr(len(curPd.Data))-1 && readCount > 0 {
-	//			// ???, key/value从长度上判断有溢出, 但没有溢出页
-	//			if !(curPd.Header.Overflow.ToUint64() > 0) {
-	//				err = fmt.Errorf("pageId(%d) keyword idx(%d) len overflow, but no overflow page", curPd.Header.PgId.ToUint64(), i)
-	//				return
-	//			}
-	//			curPd, err = bt.s.readPage(curPd.Header.Overflow)
-	//			if err != nil {
-	//				return
-	//			}
-	//			off1 = 0
-	//		}
-	//	}
-	//	d.keywordsPageView = append(d.keywordsPageView, *kw)
-	//	d.memKeywords = append(d.memKeywords, keywordDisk{
-	//		key: buf[:kw.keyLen],
-	//		val: buf[kw.valLen:],
-	//	})
-	//}
 	return
 }
 
-func (bt *BTreeDisk[K, V]) loadNodeWithPageId(pgId pageId) (d *nodeDiskDesc, err error) {
+func (bt *BTreeDisk[K, V]) loadNodeWithPageId(tx *Tx[K, V], pgId pageId) (d *nodeDiskDesc, err error) {
 	var pd pageDesc
 	pd, err = bt.s.readPage(pgId)
 	if err != nil {
 		return
 	}
-	return bt.loadNode(pd)
+	return bt.loadNode(tx, pd)
 }
 
 func (bt *BTreeDisk[K, V]) allocNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) {
@@ -504,9 +477,14 @@ func (bt *BTreeDisk[K, V]) allocNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) 
 	if err != nil {
 		return
 	}
+	pd.Header.Overflow = createPageIdFromUint64(0)
+	pd.Header.Flags = 0
+	pd.Header.sum = 0
+	pd.Header.Header = pageHeaderDat
+	pd.Header.PgId = res[0]
 	d = new(nodeDiskDesc)
-	d.pd = pd
 	d.pageLink = make([]pageDesc, 0, 4)
+	d.pageLink = append(d.pageLink, pd)
 	d.subNodes = make([]pageId, bt.c.TreeM)
 	d.memKeywords = make([]keywordDisk, 0, 4)
 	d.keywordsPageView = make([]keywordDiskDesc, 0, 4)
@@ -514,55 +492,61 @@ func (bt *BTreeDisk[K, V]) allocNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) 
 }
 
 func (bt *BTreeDisk[K, V]) freeNode(tx *Tx[K, V], node *nodeDiskDesc) (err error) {
-	ipg := node.pd
 	allPage := make([]pageId, 0, 4)
 	zeroPgId := createPageIdFromUint64(0)
 	for i := 0; i < len(node.subNodes); i++ {
 		node.subNodes[i] = zeroPgId
 	}
-	for {
-		allPage = append(allPage, ipg.Header.PgId)
-		overflowPgId := ipg.Header.Overflow
-		// 回收时不清page
-		//err = bt.s.cleanPage(ipg)
-		//if err != nil {
-		//	return
-		//}
-		if overflowPgId.ToUint64() == 0 {
-			break
-		}
-		ipg, err = bt.s.readPage(ipg.Header.Overflow)
-		if err != nil {
-			return
-		}
+	err = bt.flushSubNodes(tx, node)
+	if err != nil {
+		return
+	}
+	//for {
+	//	allPage = append(allPage, firstPage.Header.PgId)
+	//	overflowPgId := firstPage.Header.Overflow
+	//	// 回收时不清page
+	//	//err = bt.s.cleanPage(firstPage)
+	//	//if err != nil {
+	//	//	return
+	//	//}
+	//	if overflowPgId.ToUint64() == 0 {
+	//		break
+	//	}
+	//	firstPage, err = bt.s.readPage(firstPage.Header.Overflow)
+	//	if err != nil {
+	//		return
+	//	}
+	//}
+	for i := 0; i < len(node.pageLink); i++ {
+		allPage = append(allPage, node.pageLink[i].Header.PgId)
 	}
 	return bt.s.freePage(tx.header, allPage)
 }
 
 func (bt *BTreeDisk[K, V]) flushSubNodes(tx *Tx[K, V], node *nodeDiskDesc) (err error) {
 	for i := 0; i < len(node.subNodes); i++ {
-		copy(node.pd.Data[i:i*6], node.subNodes[i][:])
+		copy(node.pageLink[0].Data[i:i*6], node.subNodes[i][:])
 	}
 	cpDat := make([]byte, len(node.subNodes)*6)
-	copy(cpDat, node.pd.Data)
+	copy(cpDat, node.pageLink[0].Data)
 	err = tx.addPageModify(pageRecord{
 		typ:  pageRecordStorage,
-		pgId: node.pd.Header.PgId,
-		off:  node.pd.minSize(),
+		pgId: node.pageLink[0].Header.PgId,
+		off:  node.pageLink[0].minSize(),
 		dat:  cpDat,
 	})
 	if err != nil {
 		return
 	}
-	return bt.s.writePage(tx.header, node.pd)
+	return bt.s.writePage(tx.header, node.pageLink[0])
 }
 
 func (bt *BTreeDisk[K, V]) flushNodeKeywords(tx *Tx[K, V], node *nodeDiskDesc, idx int, onlyFlushLen bool) error {
 	// 仅刷新长度信息
 	if onlyFlushLen {
 		keywordLen := uint32(len(node.memKeywords))
-		node.pd.SetFlags(uint64(keywordLen))
-		return bt.s.writePage(tx.header, node.pd)
+		node.pageLink[0].SetFlags(uint64(keywordLen))
+		return bt.s.writePage(tx.header, node.pageLink[0])
 	} else {
 		// 判断写入模式
 		// 3种情况, 内存中的值比磁盘中的少/跟磁盘的数量一样/比磁盘中的多, 一一处理
@@ -591,8 +575,8 @@ func (bt *BTreeDisk[K, V]) flushNodeKeywords(tx *Tx[K, V], node *nodeDiskDesc, i
 				buf.Write(val)
 			}
 			// 写入的长度要手动刷新, keywords所在的页不一定是起始页
-			node.pd.SetFlags(uint64(len(node.memKeywords)))
-			err := bt.s.writePage(tx.header, node.pd)
+			node.pageLink[0].SetFlags(uint64(len(node.memKeywords)))
+			err := bt.s.writePage(tx.header, node.pageLink[0])
 			if err != nil {
 				return err
 			}
@@ -617,8 +601,8 @@ func (bt *BTreeDisk[K, V]) flushNodeKeywords(tx *Tx[K, V], node *nodeDiskDesc, i
 				buf.Write(val)
 			}
 			// 写入的长度要手动刷新, keywords所在的页不一定是起始页
-			node.pd.SetFlags(uint64(len(node.memKeywords)))
-			err := bt.s.writePage(tx.header, node.pd)
+			node.pageLink[0].SetFlags(uint64(len(node.memKeywords)))
+			err := bt.s.writePage(tx.header, node.pageLink[0])
 			if err != nil {
 				return err
 			}
@@ -652,7 +636,7 @@ func (bt *BTreeDisk[K, V]) flushNodeKeywords(tx *Tx[K, V], node *nodeDiskDesc, i
 
 func (bt *BTreeDisk[K, V]) writeKeywordDataToNode(tx *Tx[K, V], node *nodeDiskDesc, offset uint32, buf []byte) (err error) {
 	// 略过subNodes的位置
-	offset += uint32(uintptr(bt.c.TreeM) * unsafe.Sizeof(pageId{}))
+	offset += uint32(uintptr(bt.c.TreeM) * pgIdMemSize)
 	// 定位所在的page
 	var (
 		targetIdx  int
@@ -698,11 +682,15 @@ func (bt *BTreeDisk[K, V]) writeKeywordDataToNode(tx *Tx[K, V], node *nodeDiskDe
 		if len(buf) > 0 {
 			// 没有可用的页了, 分配新页
 			if targetIdx+1 >= len(node.pageLink) {
-				res, err := bt.s.allocPage(tx.header, 1)
+				var (
+					res     []pageId
+					newPage pageDesc
+				)
+				res, err = bt.s.allocPage(tx.header, 1)
 				if err != nil {
 					return err
 				}
-				newPage, err := bt.s.readPage(res[0])
+				newPage, err = bt.s.readPage(res[0])
 				if err != nil {
 					return err
 				}
@@ -728,7 +716,7 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 		root *nodeDiskDesc
 		err  error
 	)
-	root, err = bt.loadRootNode()
+	root, err = bt.loadRootNode(tx)
 	if err != nil {
 		return false, err
 	}
@@ -753,8 +741,8 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 			return false, err
 		}
 		newRoot.memKeywords = append(newRoot.memKeywords, mediumElem)
-		newRoot.subNodes[0] = left.pd.Header.PgId
-		newRoot.subNodes[1] = right.pd.Header.PgId
+		newRoot.subNodes[0] = left.pageLink[0].Header.PgId
+		newRoot.subNodes[1] = right.pageLink[0].Header.PgId
 		err = bt.flushSubNodes(tx, newRoot)
 		if err != nil {
 			return false, err
@@ -768,7 +756,7 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 			return false, err
 		}
 		// 重新设置根节点
-		err = bt.s.setRootPage(tx.header, newRoot.pd)
+		err = bt.s.setRootPage(tx.header, newRoot.pageLink[0].Header.PgId)
 		if err != nil {
 			return false, err
 		}
@@ -806,7 +794,7 @@ func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], root *nodeDiskDesc, key, val []by
 		if err != nil {
 			return false, false, err
 		}
-		subNode, err := bt.loadNode(subNodePd)
+		subNode, err := bt.loadNode(tx, subNodePd)
 		if err != nil {
 			return false, false, err
 		}
@@ -821,8 +809,8 @@ func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], root *nodeDiskDesc, key, val []by
 				return false, false, err
 			}
 			root.memKeywords = slices.Insert(root.memKeywords, index, mediumElem)
-			root.subNodes[index] = left.pd.Header.PgId
-			root.subNodes = slices.Insert(root.subNodes, index+1, right.pd.Header.PgId)
+			root.subNodes[index] = left.pageLink[0].Header.PgId
+			root.subNodes = slices.Insert(root.subNodes, index+1, right.pageLink[0].Header.PgId)
 			err = bt.flushSubNodes(tx, root)
 			if err != nil {
 				return false, false, err
@@ -886,11 +874,14 @@ func (bt *BTreeDisk[K, V]) get(tx *Tx[K, V], key []byte) (val []byte, found bool
 		root       *nodeDiskDesc
 		idx        int
 	)
-	root, err = bt.loadRootNode()
+	root, err = bt.loadRootNode(tx)
 	if err != nil {
 		return
 	}
-	targetNode, idx, err = bt.findNode(root, nil, key)
+	if len(root.memKeywords) == 0 {
+		return
+	}
+	targetNode, idx, err = bt.findNode(tx, root, nil, key)
 	if err != nil {
 		return
 	}
@@ -902,7 +893,7 @@ func (bt *BTreeDisk[K, V]) get(tx *Tx[K, V], key []byte) (val []byte, found bool
 	return
 }
 
-func (bt *BTreeDisk[K, V]) findNode(root *nodeDiskDesc, s *stack, key []byte) (*nodeDiskDesc, int, error) {
+func (bt *BTreeDisk[K, V]) findNode(tx *Tx[K, V], root *nodeDiskDesc, s *stack, key []byte) (*nodeDiskDesc, int, error) {
 	index, found := slices.BinarySearchFunc(root.memKeywords, key, func(a keywordDisk, b []byte) int {
 		return bytes.Compare(a.key, b)
 	})
@@ -922,25 +913,28 @@ func (bt *BTreeDisk[K, V]) findNode(root *nodeDiskDesc, s *stack, key []byte) (*
 			if err != nil {
 				return nil, -1, err
 			}
-			subNode, err := bt.loadNode(pd)
+			subNode, err := bt.loadNode(tx, pd)
 			if err != nil {
 				return nil, -1, err
 			}
-			return bt.findNode(subNode, s, key)
+			return bt.findNode(tx, subNode, s, key)
 		}
 	}
 }
 
 func (bt *BTreeDisk[K, V]) maxKey(tx *Tx[K, V]) (key []byte, err error) {
 	var root *nodeDiskDesc
-	root, err = bt.loadRootNode()
+	root, err = bt.loadRootNode(tx)
 	if err != nil {
 		return
 	}
-	return bt.maxKeyWithNode(root)
+	if len(root.memKeywords) == 0 {
+		return
+	}
+	return bt.maxKeyWithNode(tx, root)
 }
 
-func (bt *BTreeDisk[K, V]) maxKeyWithNode(root *nodeDiskDesc) (key []byte, err error) {
+func (bt *BTreeDisk[K, V]) maxKeyWithNode(tx *Tx[K, V], root *nodeDiskDesc) (key []byte, err error) {
 	for {
 		key = root.memKeywords[len(root.memKeywords)-1].key
 		if root.isLeaf() {
@@ -952,7 +946,7 @@ func (bt *BTreeDisk[K, V]) maxKeyWithNode(root *nodeDiskDesc) (key []byte, err e
 		if err != nil {
 			return
 		}
-		root, err = bt.loadNode(pd)
+		root, err = bt.loadNode(tx, pd)
 		if err != nil {
 			return
 		}
@@ -962,14 +956,17 @@ func (bt *BTreeDisk[K, V]) maxKeyWithNode(root *nodeDiskDesc) (key []byte, err e
 
 func (bt *BTreeDisk[K, V]) minKey(tx *Tx[K, V]) (key []byte, err error) {
 	var root *nodeDiskDesc
-	root, err = bt.loadRootNode()
+	root, err = bt.loadRootNode(tx)
 	if err != nil {
 		return
 	}
-	return bt.minKeyWithNode(root)
+	if len(root.memKeywords) == 0 {
+		return
+	}
+	return bt.minKeyWithNode(tx, root)
 }
 
-func (bt *BTreeDisk[K, V]) minKeyWithNode(root *nodeDiskDesc) (key []byte, err error) {
+func (bt *BTreeDisk[K, V]) minKeyWithNode(tx *Tx[K, V], root *nodeDiskDesc) (key []byte, err error) {
 	for {
 		key = root.memKeywords[0].key
 		if root.isLeaf() {
@@ -981,7 +978,7 @@ func (bt *BTreeDisk[K, V]) minKeyWithNode(root *nodeDiskDesc) (key []byte, err e
 		if err != nil {
 			return
 		}
-		root, err = bt.loadNode(pd)
+		root, err = bt.loadNode(tx, pd)
 		if err != nil {
 			return
 		}
@@ -991,15 +988,18 @@ func (bt *BTreeDisk[K, V]) minKeyWithNode(root *nodeDiskDesc) (key []byte, err e
 
 func (bt *BTreeDisk[K, V]) treeRange(tx *Tx[K, V], start []byte, fn func(key, val []byte) bool) (err error) {
 	var root *nodeDiskDesc
-	root, err = bt.loadRootNode()
+	root, err = bt.loadRootNode(tx)
 	if err != nil {
 		return
 	}
+	if len(root.memKeywords) == 0 {
+		return
+	}
 	s := new(stack)
-	return bt.doRange(root, s, start, fn)
+	return bt.doRange(tx, root, s, start, fn)
 }
 
-func (bt *BTreeDisk[K, V]) doRange(root *nodeDiskDesc, s *stack, start []byte, fn func(key, val []byte) bool) error {
+func (bt *BTreeDisk[K, V]) doRange(tx *Tx[K, V], root *nodeDiskDesc, s *stack, start []byte, fn func(key, val []byte) bool) error {
 	index, found := slices.BinarySearchFunc(root.memKeywords, start, func(a keywordDisk, b []byte) int {
 		return bytes.Compare(a.key, b)
 	})
@@ -1008,13 +1008,13 @@ func (bt *BTreeDisk[K, V]) doRange(root *nodeDiskDesc, s *stack, start []byte, f
 			return nil
 		}
 		s.push(stackElement{node: root, tag: uint64(index)})
-		subNode, err := bt.loadNodeWithPageId(root.subNodes[index])
+		subNode, err := bt.loadNodeWithPageId(tx, root.subNodes[index])
 		if err != nil {
 			return err
 		}
-		return bt.doRange(subNode, s, start, fn)
+		return bt.doRange(tx, subNode, s, start, fn)
 	} else {
-		isContinue, err := bt.rangeOfCentral(root, index, true, fn)
+		isContinue, err := bt.rangeOfCentral(tx, root, index, true, fn)
 		if err != nil {
 			return err
 		}
@@ -1026,7 +1026,7 @@ func (bt *BTreeDisk[K, V]) doRange(root *nodeDiskDesc, s *stack, start []byte, f
 			if parent.node == nil {
 				break
 			}
-			isContinue, err = bt.rangeOfCentral(parent.node, int(parent.tag), true, fn)
+			isContinue, err = bt.rangeOfCentral(tx, parent.node, int(parent.tag), true, fn)
 			if err != nil {
 				return err
 			}
@@ -1038,7 +1038,7 @@ func (bt *BTreeDisk[K, V]) doRange(root *nodeDiskDesc, s *stack, start []byte, f
 	}
 }
 
-func (bt *BTreeDisk[K, V]) rangeOfCentral(node *nodeDiskDesc, eIndex int, isFirst bool, fn func(key, val []byte) bool) (bool, error) {
+func (bt *BTreeDisk[K, V]) rangeOfCentral(tx *Tx[K, V], node *nodeDiskDesc, eIndex int, isFirst bool, fn func(key, val []byte) bool) (bool, error) {
 	if isFirst {
 		for i := eIndex; i < len(node.memKeywords); i++ {
 			keyword := node.memKeywords[i]
@@ -1048,11 +1048,11 @@ func (bt *BTreeDisk[K, V]) rangeOfCentral(node *nodeDiskDesc, eIndex int, isFirs
 			if node.isLeaf() {
 				continue
 			}
-			subNode, err := bt.loadNodeWithPageId(node.subNodes[i+1])
+			subNode, err := bt.loadNodeWithPageId(tx, node.subNodes[i+1])
 			if err != nil {
 				return false, err
 			}
-			isContinue, err := bt.rangeOfCentral(subNode, 0, false, fn)
+			isContinue, err := bt.rangeOfCentral(tx, subNode, 0, false, fn)
 			if err != nil {
 				return false, err
 			}
@@ -1068,11 +1068,11 @@ func (bt *BTreeDisk[K, V]) rangeOfCentral(node *nodeDiskDesc, eIndex int, isFirs
 					return false, nil
 				}
 			} else {
-				subNode, err := bt.loadNodeWithPageId(node.subNodes[i])
+				subNode, err := bt.loadNodeWithPageId(tx, node.subNodes[i])
 				if err != nil {
 					return false, err
 				}
-				isContinue, err := bt.rangeOfCentral(subNode, 0, false, fn)
+				isContinue, err := bt.rangeOfCentral(tx, subNode, 0, false, fn)
 				if err != nil {
 					return false, err
 				}
@@ -1082,11 +1082,11 @@ func (bt *BTreeDisk[K, V]) rangeOfCentral(node *nodeDiskDesc, eIndex int, isFirs
 				if !fn(keyword.key, keyword.val) {
 					return false, nil
 				}
-				subNode, err = bt.loadNodeWithPageId(node.subNodes[i+1])
+				subNode, err = bt.loadNodeWithPageId(tx, node.subNodes[i+1])
 				if err != nil {
 					return false, err
 				}
-				isContinue, err = bt.rangeOfCentral(subNode, 0, false, fn)
+				isContinue, err = bt.rangeOfCentral(tx, subNode, 0, false, fn)
 				if err != nil {
 					return false, err
 				}
@@ -1106,12 +1106,15 @@ func (bt *BTreeDisk[K, V]) del(tx *Tx[K, V], key []byte) (val []byte, found bool
 		node2 *nodeDiskDesc
 		idx   int
 	)
-	root, err = bt.loadRootNode()
+	root, err = bt.loadRootNode(tx)
 	if err != nil {
 		return
 	}
+	if len(root.memKeywords) == 0 {
+		return
+	}
 	s := new(stack)
-	node, idx, err = bt.findNode(root, s, key)
+	node, idx, err = bt.findNode(tx, root, s, key)
 	if err != nil {
 		return
 	}
@@ -1132,7 +1135,7 @@ func (bt *BTreeDisk[K, V]) del(tx *Tx[K, V], key []byte) (val []byte, found bool
 		err = bt.del2(tx, node, s)
 		return
 	}
-	node2, err = bt.loadNodeWithPageId(node.subNodes[idx])
+	node2, err = bt.loadNodeWithPageId(tx, node.subNodes[idx])
 	if err != nil {
 		return
 	}
@@ -1141,7 +1144,7 @@ func (bt *BTreeDisk[K, V]) del(tx *Tx[K, V], key []byte) (val []byte, found bool
 			node: node2,
 			tag:  uint64(len(node.subNodes) - 1),
 		})
-		node2, err = bt.loadNodeWithPageId(node2.subNodes[len(node.subNodes)-1])
+		node2, err = bt.loadNodeWithPageId(tx, node2.subNodes[len(node.subNodes)-1])
 		if err != nil {
 			return
 		}
@@ -1175,7 +1178,7 @@ func (bt *BTreeDisk[K, V]) del2(tx *Tx[K, V], leafNode *nodeDiskDesc, s *stack) 
 		// 查看兄弟节点是否有多余的关键字, 可以借一个过来, 可能是左兄弟或者右兄弟
 		if parentIdx+1 >= uint64(parentNode.subNodeSize()) {
 			// 在最右侧的节点, 只能借左兄弟了
-			leftNode, err := bt.loadNodeWithPageId(parentNode.subNodes[parentIdx-1])
+			leftNode, err := bt.loadNodeWithPageId(tx, parentNode.subNodes[parentIdx-1])
 			if err != nil {
 				return err
 			}
@@ -1200,7 +1203,7 @@ func (bt *BTreeDisk[K, V]) del2(tx *Tx[K, V], leafNode *nodeDiskDesc, s *stack) 
 			}
 		} else if parentIdx+1 < uint64(parentNode.subNodeSize()) {
 			// 可以借右兄弟的节点
-			rightNode, err := bt.loadNodeWithPageId(parentNode.subNodes[parentIdx+1])
+			rightNode, err := bt.loadNodeWithPageId(tx, parentNode.subNodes[parentIdx+1])
 			if err != nil {
 				return err
 			}
@@ -1230,7 +1233,7 @@ func (bt *BTreeDisk[K, V]) del2(tx *Tx[K, V], leafNode *nodeDiskDesc, s *stack) 
 		oldKeywordLen := len(node.memKeywords)
 		node.memKeywords = append(node.memKeywords, parentNode.memKeywords[parentIdx])
 		// 合并右兄弟节点
-		rightNode, err := bt.loadNodeWithPageId(parentNode.subNodes[parentIdx+1])
+		rightNode, err := bt.loadNodeWithPageId(tx, parentNode.subNodes[parentIdx+1])
 		if err != nil {
 			return err
 		}

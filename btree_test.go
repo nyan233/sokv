@@ -1,16 +1,18 @@
 package sokv
 
 import (
-	"encoding/binary"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zbh255/gocode/random"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func initTest(t *testing.T) {
-	err := os.Mkdir("testdata", 0644)
+	err := os.RemoveAll("testdata")
+	require.NoError(t, err)
+	err = os.Mkdir("testdata", 0644)
 	if err != nil && !os.IsExist(err) {
 		t.Fatal(err)
 	}
@@ -18,24 +20,127 @@ func initTest(t *testing.T) {
 
 func TestBTree(t *testing.T) {
 	initTest(t)
-	bt := NewBTreeDisk("testdata/test.db", 64)
-	bt.OpenWriteTx(func(tx *Tx) error {
-		return nil
+	t.Run("LittleTx", func(t *testing.T) {
+		bt := NewBTreeDisk[uint64, string](Config{
+			RootDir:                  "testdata",
+			Name:                     "testbt.littletx",
+			TreeM:                    64,
+			MaxPageCacheSize:         1024 * 1024,
+			MaxFreeListPageCacheSize: 1024 * 1024,
+		})
+		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
+		bt.SetValCodec(new(JsonTypeCodec[string]))
+		require.NoError(t, bt.Init())
+		err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+			for i := 0; i < 1024; i++ {
+				_, err = tx.Put(uint64(i), "hello world")
+				require.NoError(t, err)
+			}
+			v, found, err := tx.Get(1023)
+			if err != nil {
+				return err
+			}
+			require.True(t, found)
+			require.Equal(t, "hello world", v)
+			_, err = tx.Put(1024, "hello world")
+			require.NoError(t, err)
+			v, found, err = tx.Del(1022)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, "hello world", v)
+			v, found, err = tx.Get(1022)
+			require.NoError(t, err)
+			require.False(t, found)
+			return nil
+		})
+		require.NoError(t, err)
+		err = bt.OpenOnlyReadTx(func(tx *Tx[uint64, string]) (err error) {
+			v, found, err := tx.Get(1022)
+			require.NoError(t, err)
+			require.False(t, found)
+			v, found, err = tx.Get(512)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, "hello world", v)
+			_, err = tx.Put(10010, "hello world")
+			require.Error(t, err)
+			return nil
+		})
+		require.NoError(t, err)
 	})
-}
-
-func TestBTreeSearch(t *testing.T) {
-	initTest(t)
-	bt := NewBTreeDisk("testdata/test.db", 64)
-	require.NoError(t, bt.Init())
-	minKey, err := bt.minKey()
-	require.NoError(t, err)
-	maxKey, err := bt.maxKey()
-	require.NoError(t, err)
-	t.Logf("minKey : %d", binary.BigEndian.Uint64(minKey))
-	t.Logf("maxKey : %d", binary.BigEndian.Uint64(maxKey))
-	get, b, err := bt.get(binary.BigEndian.AppendUint64(nil, uint64(1024)))
-	assert.NoError(t, err)
-	assert.Equal(t, b, true)
-	t.Log(get)
+	t.Run("BatchLittleTx", func(t *testing.T) {
+		bt := NewBTreeDisk[uint64, string](Config{
+			RootDir:                  "testdata",
+			Name:                     "testbt.batchtx",
+			TreeM:                    64,
+			MaxPageCacheSize:         1024 * 1024,
+			MaxFreeListPageCacheSize: 1024 * 1024,
+		})
+		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
+		bt.SetValCodec(new(JsonTypeCodec[string]))
+		require.NoError(t, bt.Init())
+		for i := 0; i < 128; i++ {
+			err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+				for j := i * 1024; j < (i+1)*1024; j++ {
+					_, err = tx.Put(uint64(j), "hello world")
+					require.NoError(t, err)
+				}
+				return nil
+			})
+			require.NoError(t, err)
+		}
+	})
+	t.Run("ConcurrentTx", func(t *testing.T) {
+		bt := NewBTreeDisk[uint64, string](Config{
+			RootDir:                  "testdata",
+			Name:                     "testbt.concurrenttx",
+			TreeM:                    64,
+			MaxPageCacheSize:         1024 * 1024,
+			MaxFreeListPageCacheSize: 1024 * 1024,
+		})
+		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
+		bt.SetValCodec(new(JsonTypeCodec[string]))
+		require.NoError(t, bt.Init())
+		var (
+			wg    sync.WaitGroup
+			count atomic.Uint64
+		)
+		wg.Add(128)
+		for i := 0; i < 128; i++ {
+			go func() {
+				err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+					for j := 0; j < 1024; j++ {
+						isReplace, err := tx.Put(count.Add(1), "my is concurrent hello world")
+						require.NoError(t, err)
+						require.False(t, isReplace)
+					}
+					return nil
+				})
+				require.NoError(t, err)
+				defer wg.Done()
+			}()
+		}
+		wg.Wait()
+	})
+	t.Run("BigTx", func(t *testing.T) {
+		bt := NewBTreeDisk[uint64, string](Config{
+			RootDir:                  "testdata",
+			Name:                     "testbt.bigtx",
+			TreeM:                    64,
+			MaxPageCacheSize:         1024 * 1024,
+			MaxFreeListPageCacheSize: 1024 * 1024,
+		})
+		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
+		bt.SetValCodec(new(JsonTypeCodec[string]))
+		require.NoError(t, bt.Init())
+		err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+			for i := 0; i < 1024*16; i++ {
+				isReplace, err := tx.Put(uint64(i), random.GenStringOnAscii(128))
+				require.NoError(t, err)
+				require.False(t, isReplace)
+			}
+			return nil
+		})
+		require.NoError(t, err)
+	})
 }
