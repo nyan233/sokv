@@ -459,25 +459,27 @@ func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
 	cp, found := m.cache.readPage(pgId.ToUint64())
 	if found {
 		pd.parse(cp.data)
-		return
+	} else {
+		var buf []byte
+		buf, err = m.readRawPage(pgId)
+		if err != nil {
+			return
+		}
+		pd.parse(buf)
 	}
-	var buf []byte
-	buf, err = m.readRawPage(pgId)
-	if err != nil {
-		return
-	}
-	pd.parse(buf)
 	if !bytesIsZero(pd.rawBuf) {
 		if pd.checksum() != pd.Header.sum {
 			err = errors.New("page data corrupted")
 			return
 		}
 	}
-	m.cache.setReadValue(cachePage{
-		txSeq: 0,
-		data:  buf,
-		pgId:  pgId,
-	})
+	if !found {
+		m.cache.setReadValue(cachePage{
+			txSeq: 0,
+			data:  pd.rawBuf,
+			pgId:  pgId,
+		})
+	}
 	return
 }
 
