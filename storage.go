@@ -158,6 +158,7 @@ type pageStorageOption struct {
 	PageSize             uint32
 	MaxCacheSize         int
 	FreelistMaxCacheSize int
+	PageCipher           Cipher
 }
 
 type pageStorage struct {
@@ -165,6 +166,7 @@ type pageStorage struct {
 	opt      *pageStorageOption
 	freelist *freelist
 	cache    *pageCache
+	cipher   Cipher
 }
 
 func newPageStorage(opt *pageStorageOption) *pageStorage {
@@ -176,8 +178,9 @@ func newPageStorage(opt *pageStorageOption) *pageStorage {
 		panic("FreelistMaxCacheSize equal zero")
 	}
 	return &pageStorage{
-		opt:   opt,
-		cache: newPageCache(opt.MaxCacheSize),
+		opt:    opt,
+		cache:  newPageCache(opt.MaxCacheSize),
+		cipher: opt.PageCipher,
 	}
 }
 
@@ -448,6 +451,12 @@ func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
 	if readCount != int(m.opt.PageSize) {
 		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, m.opt.PageSize)
 	}
+	if m.cipher != nil {
+		err = m.cipher.Decrypt(buf)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return buf, nil
 }
 
@@ -483,7 +492,14 @@ func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
 	return
 }
 
-func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) error {
+func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) (err error) {
+	if m.cipher != nil {
+		buf, err = m.cipher.Encrypt(buf)
+		if err != nil {
+			return
+		}
+		defer m.cipher.free(buf)
+	}
 	writeCount, err := m.file.WriteAt(buf, int64(pgId.ToUint64()*uint64(m.opt.PageSize)))
 	if err != nil {
 		return err

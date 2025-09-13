@@ -124,6 +124,7 @@ type Config struct {
 	MaxPageCacheSize         int
 	MaxFreeListPageCacheSize int
 	Logger                   *slog.Logger
+	CipherFactory            func() (Cipher, error)
 }
 
 func NewBTreeDisk[K any, V any](c Config) *BTreeDisk[K, V] {
@@ -156,14 +157,25 @@ func (bt *BTreeDisk[K, V]) Init() error {
 	} else {
 		bt.logger = bt.c.Logger
 	}
+	var (
+		cipher Cipher
+		err    error
+	)
+	if bt.c.CipherFactory != nil {
+		cipher, err = bt.c.CipherFactory()
+		if err != nil {
+			return err
+		}
+	}
 	bt.s = newPageStorage(&pageStorageOption{
 		DataPath:             bt.getFilePath(".dat"),
 		FreelistPath:         bt.getFilePath(".freelist"),
 		PageSize:             uint32(sys.GetSysPageSize()),
 		MaxCacheSize:         bt.c.MaxPageCacheSize,
 		FreelistMaxCacheSize: bt.c.MaxFreeListPageCacheSize,
+		PageCipher:           cipher,
 	})
-	err := bt.s.init()
+	err = bt.s.init()
 	if err != nil {
 		return err
 	}
