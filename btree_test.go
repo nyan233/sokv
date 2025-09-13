@@ -37,9 +37,9 @@ func TestBTree(t *testing.T) {
 				require.NoError(t, err)
 			}
 			v, found, err := tx.Get(1023)
-			if err != nil {
-				return err
-			}
+			require.NoError(t, err)
+			v, found, err = tx.Get(512)
+			require.NoError(t, err)
 			require.True(t, found)
 			require.Equal(t, "hello world", v)
 			_, err = tx.Put(1024, "hello world")

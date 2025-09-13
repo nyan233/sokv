@@ -82,28 +82,11 @@ func (node *nodeDiskDesc) sumKeywordDiskOff(idx int) (off uint32) {
 }
 
 func (node *nodeDiskDesc) isLeaf() bool {
-	return node.subNodes[0].ToUint64() == 0
-}
-
-func (node *nodeDiskDesc) effectiveSubNodes() []pageId {
-	res := make([]pageId, 0, len(node.subNodes))
-	for _, sub := range node.subNodes {
-		if sub.ToUint64() > 0 {
-			res = append(res, sub)
-		}
-	}
-	return res
+	return len(node.subNodes) == 0
 }
 
 func (node *nodeDiskDesc) subNodeSize() (s uint32) {
-	for _, sub := range node.subNodes {
-		if sub.ToUint64() > 0 {
-			s++
-		} else {
-			break
-		}
-	}
-	return
+	return uint32(len(node.subNodes))
 }
 
 func (node *nodeDiskDesc) delLastKeyword() keywordDisk {
@@ -416,15 +399,19 @@ func (bt *BTreeDisk[K, V]) loadNode(tx *Tx[K, V], pd pageDesc) (d *nodeDiskDesc,
 		return
 	}
 	var (
-		off1    = uintptr(bt.c.TreeM) * unsafe.Sizeof(pageId{})
+		off1    = uintptr(bt.c.TreeM) * pgIdMemSize
 		readOff = off1
 		curPd   = pd
 		buf     bytes.Buffer
 	)
 	d = new(nodeDiskDesc)
-	d.subNodes = make([]pageId, bt.c.TreeM)
+	d.subNodes = make([]pageId, 0, bt.c.TreeM)
 	for i := 0; i < bt.c.TreeM; i++ {
-		d.subNodes[i] = pageId(curPd.Data[i*6 : (i+1)*6])
+		pgId := pageId(curPd.Data[i*int(pgIdMemSize) : (i+1)*int(pgIdMemSize)])
+		if pgId.ToUint64() == 0 {
+			break
+		}
+		d.subNodes = append(d.subNodes, pgId)
 	}
 	keywordLen := curPd.Header.Flags & uint64(math.MaxUint16)
 	// TODO : 后台页整理, 有些页可能原来有很多溢出页, 但之后因为调整/删除各种原因数据变少之后这些不用的溢出页需要释放
@@ -523,11 +510,17 @@ func (bt *BTreeDisk[K, V]) freeNode(tx *Tx[K, V], node *nodeDiskDesc) (err error
 	return bt.s.freePage(tx.header, allPage)
 }
 
+// NOTE: flushSubNodes全量覆写, 避免旧节点的脏数据
 func (bt *BTreeDisk[K, V]) flushSubNodes(tx *Tx[K, V], node *nodeDiskDesc) (err error) {
-	for i := 0; i < len(node.subNodes); i++ {
-		copy(node.pageLink[0].Data[i:i*6], node.subNodes[i][:])
+	zeroPgId := createPageIdFromUint64(0)
+	for i := 0; i < bt.c.TreeM; i++ {
+		if i < len(node.subNodes) {
+			copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], node.subNodes[i][:])
+		} else {
+			copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], zeroPgId[:])
+		}
 	}
-	cpDat := make([]byte, len(node.subNodes)*6)
+	cpDat := make([]byte, len(node.subNodes)*int(pgIdMemSize))
 	copy(cpDat, node.pageLink[0].Data)
 	err = tx.addPageModify(pageRecord{
 		typ:  pageRecordStorage,
@@ -790,11 +783,7 @@ func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], root *nodeDiskDesc, key, val []by
 		}
 		return false, bt.nodeEQMax(root), nil
 	} else {
-		subNodePd, err := bt.s.readPage(root.subNodes[index])
-		if err != nil {
-			return false, false, err
-		}
-		subNode, err := bt.loadNode(tx, subNodePd)
+		subNode, err := bt.loadNodeWithPageId(tx, root.subNodes[index])
 		if err != nil {
 			return false, false, err
 		}
@@ -852,8 +841,8 @@ func (bt *BTreeDisk[K, V]) splitNode(tx *Tx[K, V], root *nodeDiskDesc) (medium k
 	}
 	s1.memKeywords = root.memKeywords[:len(root.memKeywords)/2]
 	s2.memKeywords = root.memKeywords[len(root.memKeywords)/2+1:]
-	if root.isLeaf() {
-		rootSubNodes := root.effectiveSubNodes()
+	if !root.isLeaf() {
+		rootSubNodes := root.subNodes
 		copy(s1.subNodes, rootSubNodes[:len(rootSubNodes)/2])
 		copy(s2.subNodes, rootSubNodes[len(rootSubNodes)/2:])
 	}
@@ -1238,8 +1227,9 @@ func (bt *BTreeDisk[K, V]) del2(tx *Tx[K, V], leafNode *nodeDiskDesc, s *stack) 
 			return err
 		}
 		node.memKeywords = append(node.memKeywords, rightNode.memKeywords...)
-		rightSubNodes := rightNode.effectiveSubNodes()
-		copy(node.subNodes[node.subNodeSize():], rightSubNodes)
+		//rightSubNodes := rightNode.effectiveSubNodes()
+		//copy(node.subNodes[node.subNodeSize():], rightSubNodes)
+		node.subNodes = append(node.subNodes, rightNode.subNodes...)
 		// 合并完成之后删除父节点中的元素和多余的子节点
 		parentNode.memKeywords = slices.Delete(parentNode.memKeywords, int(parentIdx), int(parentIdx)+1)
 		parentNode.subNodes = slices.Delete(parentNode.subNodes, int(parentIdx+1), int(parentIdx+2))
