@@ -1,42 +1,63 @@
 package sokv
 
 import (
+	"github.com/nyan233/sokv/internal/sys"
 	"github.com/stretchr/testify/require"
-	"os"
+	"path"
 	"testing"
 )
 
-func initTest(t *testing.T) {
-	err := os.Mkdir("testdata", 0644)
-	if err != nil && !os.IsExist(err) {
-		t.Fatal(err)
-	}
-}
-
-func TestFreelistHeap(t *testing.T) {
+func TestFreelist(t *testing.T) {
 	initTest(t)
-	freelist := newFreelist("testdata/test.db.freelist")
-	err := freelist.init()
-	if err != nil {
-		t.Fatal(err)
+	f := newFreelist(&pageStorageOption{
+		FreelistPath:         path.Join("testdata", "testbt.freelist"),
+		PageSize:             uint32(sys.GetSysPageSize()),
+		MaxCacheSize:         1024,
+		FreelistMaxCacheSize: 1024,
+	})
+	require.NoError(t, f.init())
+	var pgIdList []pageId
+	for i := 3; i <= 255; i++ {
+		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
 	}
-	defer os.Remove("testdata/test.db.freelist")
-	for i := 766; i < 1024*64; i++ {
-		p := createPageIdFromUint64(uint64(i))
-		err = freelist.pushOne(p)
-		if err != nil {
-			t.Fatal(err)
-		}
+	txh := &txHeader{
+		seq:                     1,
+		isRead:                  false,
+		isRollback:              false,
+		isCommit:                false,
+		records:                 make([]pageRecord, 0),
+		storagePageChangeRecord: make(map[uint64][]pageRecord),
+		freePageChangeRecord:    make(map[uint64][]pageRecord),
 	}
-	for i := 0; i < 1024; i++ {
-		p, found, err := freelist.popOne()
-		if err != nil {
-			t.Fatal(err)
+	require.NoError(t, f.initPageIdList(txh, pgIdList))
+	var nextPgId uint64 = 3
+	for {
+		if nextPgId > 255 {
+			break
 		}
-		if !found {
-			t.Fatal("free list not found")
-		}
-		require.Equal(t, uint64(i+766), p.ToUint64())
-		t.Logf("pop pageId : %d", p.ToUint64())
+		p, found, err := f.popOne(txh)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, p.ToUint64(), nextPgId)
+		nextPgId++
 	}
+	_, found, err := f.popOne(txh)
+	require.NoError(t, err)
+	require.False(t, found)
+	for i := 256; i <= 512; i++ {
+		err = f.pushOne(txh, createPageIdFromUint64(uint64(i)))
+		require.NoError(t, err)
+	}
+	nextPgId = 256
+	for {
+		if nextPgId > 510 {
+			break
+		}
+		p, found, err := f.popOne(txh)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, p.ToUint64(), nextPgId)
+		nextPgId++
+	}
+
 }
