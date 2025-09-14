@@ -208,7 +208,7 @@ func (bt *BTreeDisk[K, V]) Init() error {
 			return err
 		}
 	}
-	bt.recordLogFile, err = os.OpenFile(bt.getFilePath(".record"), os.O_CREATE|os.O_APPEND, 0644)
+	bt.recordLogFile, err = os.OpenFile(bt.getFilePath(".record"), os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
@@ -484,7 +484,7 @@ func (bt *BTreeDisk[K, V]) allocNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) 
 	d = new(nodeDiskDesc)
 	d.pageLink = make([]pageDesc, 0, 4)
 	d.pageLink = append(d.pageLink, pd)
-	d.subNodes = make([]pageId, bt.c.TreeM)
+	d.subNodes = make([]pageId, 0, bt.c.TreeM)
 	d.memKeywords = make([]keywordDisk, 0, 4)
 	d.keywordsPageView = make([]keywordDiskDesc, 0, 4)
 	return
@@ -532,7 +532,7 @@ func (bt *BTreeDisk[K, V]) flushSubNodes(tx *Tx[K, V], node *nodeDiskDesc) (err 
 			copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], zeroPgId[:])
 		}
 	}
-	cpDat := make([]byte, len(node.subNodes)*int(pgIdMemSize))
+	cpDat := make([]byte, bt.c.TreeM*int(pgIdMemSize))
 	copy(cpDat, node.pageLink[0].Data)
 	err = tx.addPageModify(pageRecord{
 		typ:  pageRecordStorage,
@@ -746,8 +746,8 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 			return false, err
 		}
 		newRoot.memKeywords = append(newRoot.memKeywords, mediumElem)
-		newRoot.subNodes[0] = left.pageLink[0].Header.PgId
-		newRoot.subNodes[1] = right.pageLink[0].Header.PgId
+		newRoot.subNodes = append(newRoot.subNodes, left.pageLink[0].Header.PgId)
+		newRoot.subNodes = append(newRoot.subNodes, right.pageLink[0].Header.PgId)
 		err = bt.flushSubNodes(tx, newRoot)
 		if err != nil {
 			return false, err
@@ -761,6 +761,7 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 			return false, err
 		}
 		// 重新设置根节点
+
 		err = bt.s.setRootPage(tx.header, newRoot.pageLink[0].Header.PgId)
 		if err != nil {
 			return false, err
@@ -1288,5 +1289,5 @@ func (bt *BTreeDisk[K, V]) nodeGEQMin(node *nodeDiskDesc) bool {
 }
 
 func (bt *BTreeDisk[K, V]) nodeEQMax(node *nodeDiskDesc) bool {
-	return len(node.memKeywords) == bt.c.TreeM-1
+	return len(node.memKeywords) >= bt.c.TreeM-1
 }

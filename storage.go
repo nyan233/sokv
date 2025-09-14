@@ -240,6 +240,17 @@ func (m *pageStorage) initFile() (err error) {
 	if err != nil {
 		return
 	}
+	if m.cipher != nil {
+		zeroBuf := make([]byte, m.opt.PageSize)
+		err = m.writeRawPage(createPageIdFromUint64(1), zeroBuf)
+		if err != nil {
+			return
+		}
+		err = m.writeRawPage(createPageIdFromUint64(2), zeroBuf)
+		if err != nil {
+			return
+		}
+	}
 	pgIdList := make([]pageId, 0, defaultPageCount-3)
 	for i := 3; i < defaultPageCount; i++ {
 		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
@@ -287,11 +298,11 @@ func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
 	return md, nil
 }
 
-func (m *pageStorage) grow() (err error) {
+func (m *pageStorage) grow(txh *txHeader) (pageCount uint64, err error) {
 	// 大于1GB之后每次增长1GB, 小于1GB则*2
 	stat, err := m.file.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	fileSize := stat.Size()
 	newFileSize := fileSize * 2
@@ -300,16 +311,16 @@ func (m *pageStorage) grow() (err error) {
 	}
 	err = m.file.Truncate(newFileSize)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	freePageStart := fileSize / int64(m.opt.PageSize)
 	freePageEnd := newFileSize / int64(m.opt.PageSize)
+	pageCount = uint64((newFileSize - fileSize) / int64(m.opt.PageSize))
+	pageIdList := make([]pageId, 0, pageCount)
 	for i := freePageStart; i < freePageEnd; i++ {
-		err = m.freelist.pushOne(&txHeader{seq: 0}, createPageIdFromUint64(uint64(i)))
-		if err != nil {
-			return err
-		}
+		pageIdList = append(pageIdList, createPageIdFromUint64(uint64(i)))
 	}
+	err = m.freelist.initPageIdList(txh, pageIdList)
 	return
 }
 
@@ -347,6 +358,16 @@ func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) erro
 	pgId := createPageIdFromUint64(0)
 	md.header.rootNodePgId = rootPgId
 	md.writeHeader2RawBuf()
+	err = txh.addPageModify(pageRecord{
+		typ: pageRecordStorage,
+		// metadata pageId
+		pgId: createPageIdFromUint64(0),
+		off:  0,
+		dat:  md.rawBuf[:md.minSize()],
+	})
+	if err != nil {
+		return err
+	}
 	m.cache.setDirtyPage(cachePage{
 		txSeq: txh.seq,
 		data:  md.rawBuf,
@@ -413,22 +434,53 @@ func (m *pageStorage) writePage(txh *txHeader, pd pageDesc) error {
 }
 
 func (m *pageStorage) allocPage(txh *txHeader, n int) (res []pageId, err error) {
-	res = make([]pageId, 0, n)
-	res, err = m.freelist.pop(txh, n)
-	if err != nil {
-		return
+	if n <= 0 {
+		return nil, nil
 	}
-	if len(res) < n {
-		err = m.grow()
-		if err != nil {
-			return nil, err
-		}
-		var pageIdList2 []pageId
-		pageIdList2, err = m.freelist.pop(txh, n-len(res))
+	res = make([]pageId, 0, n)
+	//res, err = m.freelist.pop(txh, n)
+	//if err != nil {
+	//	return
+	//}
+	//if len(res) < n {
+	//	var count int64
+	//	count, err = m.grow()
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//	var pageIdList2 []pageId
+	//	pageIdList2, err = m.freelist.pop(txh, n-len(res))
+	//	if err != nil {
+	//		return
+	//	}
+	//	res = append(res, pageIdList2...)
+	//}
+	for len(res) < n {
+		var (
+			freeLen uint64
+			popN    uint64
+			resTmp  []pageId
+		)
+		freeLen, err = m.freelist.len(txh)
 		if err != nil {
 			return
 		}
-		res = append(res, pageIdList2...)
+		if freeLen == 0 {
+			freeLen, err = m.grow(txh)
+			if err != nil {
+				return
+			}
+		}
+		if freeLen > uint64(n)-uint64(len(res)) {
+			popN = uint64(n) - uint64(len(res))
+		} else {
+			popN = freeLen
+		}
+		resTmp, err = m.freelist.pop(txh, popN)
+		if err != nil {
+			return
+		}
+		res = append(res, resTmp...)
 	}
 	return res, nil
 }
@@ -451,7 +503,7 @@ func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
 	if readCount != int(m.opt.PageSize) {
 		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, m.opt.PageSize)
 	}
-	if m.cipher != nil {
+	if m.cipher != nil && !bytesIsZero(buf) {
 		err = m.cipher.Decrypt(buf)
 		if err != nil {
 			return nil, err

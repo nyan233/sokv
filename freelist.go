@@ -134,6 +134,17 @@ func (f *freelist) initPageIdList(txh *txHeader, pgIdList []pageId) (err error) 
 		page        freelistPage
 	)
 	for len(pgIdList) > 0 {
+		var stat os.FileInfo
+		stat, err = f.file.Stat()
+		if err != nil {
+			return
+		}
+		if stat.Size() <= int64(idx)*int64(f.opt.PageSize) {
+			err = f.growFile()
+			if err != nil {
+				return
+			}
+		}
 		page, err = f.readPage(txh, uint64(idx))
 		if err != nil {
 			return
@@ -158,6 +169,18 @@ func (f *freelist) initPageIdList(txh *txHeader, pgIdList []pageId) (err error) 
 		err = f.writePage(txh, uint64(idx), page)
 		if err != nil {
 			return err
+		}
+		// 非初始化时写入页修改记录
+		if txh.seq > 0 {
+			err = txh.addPageModify(pageRecord{
+				typ:  pageRecordFree,
+				pgId: createPageIdFromUint64(uint64(idx)),
+				off:  0,
+				dat:  page.rawBuf,
+			})
+			if err != nil {
+				return err
+			}
 		}
 		pgIdList = pgIdList[maxWrite:]
 		idx++
@@ -257,9 +280,9 @@ func (f *freelist) popOne(txh *txHeader) (p pageId, found bool, err error) {
 	return f.popPageId(txh)
 }
 
-func (f *freelist) pop(txh *txHeader, n int) ([]pageId, error) {
+func (f *freelist) pop(txh *txHeader, n uint64) ([]pageId, error) {
 	res := make([]pageId, 0, n)
-	for i := 0; i < n; i++ {
+	for i := uint64(0); i < n; i++ {
 		p, found, err := f.popPageId(txh)
 		if err != nil {
 			return nil, err
@@ -634,5 +657,15 @@ func (f *freelist) pushPageId(txh *txHeader, pageId pageId) (err error) {
 		}
 		currentLength = parentIndex
 	}
+	return
+}
+
+func (f *freelist) len(txh *txHeader) (v uint64, err error) {
+	var firstPage freelistPage
+	firstPage, err = f.readPage(txh, 0)
+	if err != nil {
+		return
+	}
+	v = firstPage.pgIdList[0].ToUint64()
 	return
 }

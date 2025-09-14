@@ -27,6 +27,15 @@ func TestBTree(t *testing.T) {
 			TreeM:                    64,
 			MaxPageCacheSize:         1024 * 1024,
 			MaxFreeListPageCacheSize: 1024 * 1024,
+			//CipherFactory: func() (Cipher, error) {
+			//	const AesKeyHex = "112233445566778899aabbccddeeff11"
+			//	key := make([]byte, hex.DecodedLen(len(AesKeyHex)))
+			//	_, err := hex.Decode(key, []byte(AesKeyHex))
+			//	if err != nil {
+			//		return nil, err
+			//	}
+			//	return NewAseCipher(key)
+			//},
 		})
 		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
 		bt.SetValCodec(new(JsonTypeCodec[string]))

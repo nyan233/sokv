@@ -185,7 +185,12 @@ func (tx *Tx[K, V]) doCommit() error {
 	if err != nil {
 		return err
 	}
-	return tx.tree.doWritePageData(tx.header)
+	err = tx.tree.doWritePageData(tx.header)
+	if err != nil {
+		return err
+	}
+	// NOTE: 这里不调用sync来同步文件元数据, 即使文件系统的元数据是延迟写入的, 没更新成功重新打开时走故障恢复流程吧
+	return tx.recordLog.Truncate(0)
 }
 
 func (tx *Tx[K, V]) addPageModify(r pageRecord) error {
