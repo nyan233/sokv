@@ -9,7 +9,7 @@ import (
 
 func TestFreelist(t *testing.T) {
 	initTest(t)
-	f := newFreelist(&pageStorageOption{
+	f := newFreelist2(&pageStorageOption{
 		FreelistPath:         path.Join("testdata", "testbt.freelist"),
 		PageSize:             uint32(sys.GetSysPageSize()),
 		MaxCacheSize:         1024,
@@ -29,23 +29,21 @@ func TestFreelist(t *testing.T) {
 		storagePageChangeRecord: make(map[uint64][]pageRecord),
 		freePageChangeRecord:    make(map[uint64][]pageRecord),
 	}
-	require.NoError(t, f.initPageIdList(txh, pgIdList))
+	require.NoError(t, f.build(txh, pgIdList))
 	var nextPgId uint64 = 3
 	for {
 		if nextPgId > 255 {
 			break
 		}
-		p, found, err := f.popOne(txh)
+		p, err := f.pop(txh)
 		require.NoError(t, err)
-		require.True(t, found)
 		require.Equal(t, p.ToUint64(), nextPgId)
 		nextPgId++
 	}
-	_, found, err := f.popOne(txh)
-	require.NoError(t, err)
-	require.False(t, found)
+	_, err := f.pop(txh)
+	require.Equal(t, err, errNoAvailablePage)
 	for i := 256; i <= 512; i++ {
-		err = f.pushOne(txh, createPageIdFromUint64(uint64(i)))
+		err = f.push(txh, createPageIdFromUint64(uint64(i)))
 		require.NoError(t, err)
 	}
 	nextPgId = 256
@@ -53,9 +51,8 @@ func TestFreelist(t *testing.T) {
 		if nextPgId > 510 {
 			break
 		}
-		p, found, err := f.popOne(txh)
+		p, err := f.pop(txh)
 		require.NoError(t, err)
-		require.True(t, found)
 		require.Equal(t, p.ToUint64(), nextPgId)
 		nextPgId++
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/nyan233/sokv/internal/sys"
 	"hash/crc32"
+	"log/slog"
 	"os"
 	"strconv"
 	"unsafe"
@@ -159,12 +160,13 @@ type pageStorageOption struct {
 	MaxCacheSize         int
 	FreelistMaxCacheSize int
 	PageCipher           Cipher
+	Logger               *slog.Logger
 }
 
 type pageStorage struct {
 	file     *os.File
 	opt      *pageStorageOption
-	freelist *freelist
+	freelist *freelist2
 	cache    *pageCache
 	cipher   Cipher
 }
@@ -210,7 +212,7 @@ func (m *pageStorage) init() (err error) {
 		return
 	}
 	m.opt.PageSize = md.header.pageSize
-	m.freelist = newFreelist(m.opt)
+	m.freelist = newFreelist2(m.opt)
 	return m.freelist.init()
 }
 
@@ -229,7 +231,7 @@ func (m *pageStorage) initFile() (err error) {
 	md.header.header = medataHeader
 	md.header.pageSize = m.opt.PageSize
 	// init freelist
-	m.freelist = newFreelist(m.opt)
+	m.freelist = newFreelist2(m.opt)
 	err = m.freelist.init()
 	if err != nil {
 		return
@@ -251,11 +253,11 @@ func (m *pageStorage) initFile() (err error) {
 			return
 		}
 	}
-	pgIdList := make([]pageId, 0, defaultPageCount-3)
+	pgIdList := make([]pageId, 0, defaultPageCount)
 	for i := 3; i < defaultPageCount; i++ {
 		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
 	}
-	return m.freelist.initPageIdList(&txHeader{seq: 0}, pgIdList)
+	return m.freelist.build(&txHeader{seq: 0}, pgIdList)
 }
 
 func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
@@ -320,7 +322,7 @@ func (m *pageStorage) grow(txh *txHeader) (pageCount uint64, err error) {
 	for i := freePageStart; i < freePageEnd; i++ {
 		pageIdList = append(pageIdList, createPageIdFromUint64(uint64(i)))
 	}
-	err = m.freelist.initPageIdList(txh, pageIdList)
+	err = m.freelist.build(txh, pageIdList)
 	return
 }
 
@@ -438,49 +440,23 @@ func (m *pageStorage) allocPage(txh *txHeader, n int) (res []pageId, err error) 
 		return nil, nil
 	}
 	res = make([]pageId, 0, n)
-	//res, err = m.freelist.pop(txh, n)
-	//if err != nil {
-	//	return
-	//}
-	//if len(res) < n {
-	//	var count int64
-	//	count, err = m.grow()
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//	var pageIdList2 []pageId
-	//	pageIdList2, err = m.freelist.pop(txh, n-len(res))
-	//	if err != nil {
-	//		return
-	//	}
-	//	res = append(res, pageIdList2...)
-	//}
 	for len(res) < n {
 		var (
-			freeLen uint64
-			popN    uint64
-			resTmp  []pageId
+			p pageId
 		)
-		freeLen, err = m.freelist.len(txh)
+		p, err = m.freelist.pop(txh)
 		if err != nil {
-			return
-		}
-		if freeLen == 0 {
-			freeLen, err = m.grow(txh)
-			if err != nil {
+			if errors.Is(err, errNoAvailablePage) {
+				_, err = m.grow(txh)
+				if err != nil {
+					return res, err
+				}
+				continue
+			} else {
 				return
 			}
 		}
-		if freeLen > uint64(n)-uint64(len(res)) {
-			popN = uint64(n) - uint64(len(res))
-		} else {
-			popN = freeLen
-		}
-		resTmp, err = m.freelist.pop(txh, popN)
-		if err != nil {
-			return
-		}
-		res = append(res, resTmp...)
+		res = append(res, p)
 	}
 	return res, nil
 }
@@ -491,7 +467,13 @@ func (m *pageStorage) freePage(txh *txHeader, pgIdList []pageId) error {
 			return fmt.Errorf("free page type not is dat")
 		}
 	}
-	return m.freelist.push(txh, pgIdList)
+	for _, pgId := range pgIdList {
+		err := m.freelist.push(txh, pgId)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {

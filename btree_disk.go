@@ -174,6 +174,7 @@ func (bt *BTreeDisk[K, V]) Init() error {
 		MaxCacheSize:         bt.c.MaxPageCacheSize,
 		FreelistMaxCacheSize: bt.c.MaxFreeListPageCacheSize,
 		PageCipher:           cipher,
+		Logger:               bt.logger,
 	})
 	err = bt.s.init()
 	if err != nil {
