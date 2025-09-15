@@ -321,7 +321,7 @@ func (bt *BTreeDisk[K, V]) doWritePageData(txh *txHeader) error {
 	return nil
 }
 
-func (bt *BTreeDisk[K, V]) OpenOnlyReadTx(logic func(tx *Tx[K, V]) error) (err error) {
+func (bt *BTreeDisk[K, V]) BeginOnlyReadTx(logic func(tx *Tx[K, V]) error) (err error) {
 	tx := &Tx[K, V]{
 		header: &txHeader{
 			seq:        bt.txSeq.Load(),
@@ -343,7 +343,7 @@ func (bt *BTreeDisk[K, V]) OpenOnlyReadTx(logic func(tx *Tx[K, V]) error) (err e
 	return tx.commit()
 }
 
-func (bt *BTreeDisk[K, V]) OpenWriteTx(logic func(tx *Tx[K, V]) error) (err error) {
+func (bt *BTreeDisk[K, V]) BeginWriteTx(logic func(tx *Tx[K, V]) error) (err error) {
 	tx := &Tx[K, V]{
 		header: &txHeader{
 			seq:        bt.txSeq.Add(1),

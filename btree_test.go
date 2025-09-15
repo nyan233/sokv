@@ -40,7 +40,7 @@ func TestBTree(t *testing.T) {
 		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
 		bt.SetValCodec(new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
-		err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+		err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
 			for i := 0; i < 1024; i++ {
 				_, err = tx.Put(uint64(i), "hello world")
 				require.NoError(t, err)
@@ -63,7 +63,7 @@ func TestBTree(t *testing.T) {
 			return nil
 		})
 		require.NoError(t, err)
-		err = bt.OpenOnlyReadTx(func(tx *Tx[uint64, string]) (err error) {
+		err = bt.BeginOnlyReadTx(func(tx *Tx[uint64, string]) (err error) {
 			v, found, err := tx.Get(1022)
 			require.NoError(t, err)
 			require.False(t, found)
@@ -89,7 +89,7 @@ func TestBTree(t *testing.T) {
 		bt.SetValCodec(new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		for i := 0; i < 128; i++ {
-			err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+			err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
 				for j := i * 1024; j < (i+1)*1024; j++ {
 					_, err = tx.Put(uint64(j), "hello world")
 					require.NoError(t, err)
@@ -117,7 +117,7 @@ func TestBTree(t *testing.T) {
 		wg.Add(128)
 		for i := 0; i < 128; i++ {
 			go func() {
-				err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+				err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
 					for j := 0; j < 1024; j++ {
 						isReplace, err := tx.Put(count.Add(1), "my is concurrent hello world")
 						require.NoError(t, err)
@@ -142,7 +142,7 @@ func TestBTree(t *testing.T) {
 		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
 		bt.SetValCodec(new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
-		err := bt.OpenWriteTx(func(tx *Tx[uint64, string]) (err error) {
+		err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
 			for i := 0; i < 1024*16; i++ {
 				isReplace, err := tx.Put(uint64(i), random.GenStringOnAscii(128))
 				require.NoError(t, err)
