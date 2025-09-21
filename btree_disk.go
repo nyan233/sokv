@@ -106,7 +106,10 @@ type diskLocalData struct {
 }
 
 type BTreeDisk[K any, V any] struct {
-	rw            sync.RWMutex
+	// 用于保证事务提交时操作pageCache时不会和读者产生冲突
+	rw sync.RWMutex
+	// 用于保证事务隔离级别为可串行的互斥锁
+	txMu          sync.Mutex
 	keyCodec      Codec[K]
 	valCodec      Codec[V]
 	size          atomic.Uint64
@@ -125,6 +128,7 @@ type Config struct {
 	MaxFreeListPageCacheSize int
 	Logger                   *slog.Logger
 	CipherFactory            func() (Cipher, error)
+	Comparator               func(a, b []byte) int
 }
 
 func NewBTreeDisk[K any, V any](c Config) *BTreeDisk[K, V] {
@@ -156,6 +160,9 @@ func (bt *BTreeDisk[K, V]) Init() error {
 		}))
 	} else {
 		bt.logger = bt.c.Logger
+	}
+	if bt.c.Comparator == nil {
+		bt.c.Comparator = bytes.Compare
 	}
 	var (
 		cipher Cipher
@@ -230,10 +237,14 @@ func (bt *BTreeDisk[K, V]) Init() error {
 
 func (bt *BTreeDisk[K, V]) crashRecovery(recordLog *os.File) error {
 	var (
-		txh = &txHeader{
-			records:                 make([]pageRecord, 0, 16),
-			storagePageChangeRecord: make(map[uint64][]pageRecord, 16),
-			freePageChangeRecord:    make(map[uint64][]pageRecord, 16),
+		tx = &Tx[K, V]{
+			header: &txHeader{
+				records:                 make([]pageRecord, 0, 16),
+				storagePageChangeRecord: make(map[uint64][]pageRecord, 16),
+				freePageChangeRecord:    make(map[uint64][]pageRecord, 16),
+			},
+			tree:      bt,
+			recordLog: recordLog,
 		}
 	)
 	buf, err := io.ReadAll(recordLog)
@@ -278,19 +289,20 @@ func (bt *BTreeDisk[K, V]) crashRecovery(recordLog *os.File) error {
 		record.off = binary.BigEndian.Uint32(buf[:4])
 		buf = buf[4:]
 		record.dat = buf[:header.length-record.minSize()]
-		if txh.seq == 0 {
-			txh.seq = record.txSeq
+		if tx.header.seq == 0 {
+			tx.header.seq = record.txSeq
 		}
-		err = txh.addPageModify(record)
+		err = tx.addPageModify(record)
 		if err != nil {
 			panic(err)
 		}
 	}
-	return bt.doWritePageData(txh)
+	return bt.doWritePageData(tx, true)
 }
 
 // NOTE : 这里不需要处理扩容, 写脏页时底层文件已经扩容了, 如果这里会触发io.EOF说明文件大小不正确, 这可能是代码的Bug或者底层文件系统的Bug
-func (bt *BTreeDisk[K, V]) doWritePageData(txh *txHeader) error {
+func (bt *BTreeDisk[K, V]) doWritePageData(tx *Tx[K, V], isRecovery bool) error {
+	txh := tx.header
 	for pgId, changeList := range txh.storagePageChangeRecord {
 		rawPage, err := bt.s.readRawPage(createPageIdFromUint64(pgId))
 		if err != nil {
@@ -317,7 +329,7 @@ func (bt *BTreeDisk[K, V]) doWritePageData(txh *txHeader) error {
 			return err
 		}
 	}
-	bt.s.deleteAllDirtyPage()
+	tx.flushAllShadowPage(isRecovery)
 	return nil
 }
 
@@ -369,21 +381,16 @@ func (bt *BTreeDisk[K, V]) BeginWriteTx(logic func(tx *Tx[K, V]) error) (err err
 	return tx.commit()
 }
 
-// 丢弃所有脏页, 用于回滚未提交的事务
-func (bt *BTreeDisk[K, V]) rollbackDirtyPage() {
-	bt.s.deleteAllDirtyPage()
-}
-
 func (bt *BTreeDisk[K, V]) loadRootNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) {
 	var (
 		pd   pageDesc
 		pgId pageId
 	)
-	pgId, err = bt.s.readRootPage()
+	pgId, err = bt.s.readRootPage(tx.header)
 	if err != nil {
 		return
 	}
-	pd, err = bt.s.readPage(pgId)
+	pd, err = bt.s.readPage(tx.header, pgId)
 	if err != nil {
 		return
 	}
@@ -433,7 +440,7 @@ func (bt *BTreeDisk[K, V]) loadNode(tx *Tx[K, V], pd pageDesc) (d *nodeDiskDesc,
 		d.pageLink = append(d.pageLink, curPd)
 		readOff = 0
 		if curPd.Header.Overflow.ToUint64() > 0 {
-			curPd, err = bt.s.readPage(curPd.Header.Overflow)
+			curPd, err = bt.s.readPage(tx.header, curPd.Header.Overflow)
 			if err != nil {
 				return
 			}
@@ -457,7 +464,7 @@ func (bt *BTreeDisk[K, V]) loadNode(tx *Tx[K, V], pd pageDesc) (d *nodeDiskDesc,
 
 func (bt *BTreeDisk[K, V]) loadNodeWithPageId(tx *Tx[K, V], pgId pageId) (d *nodeDiskDesc, err error) {
 	var pd pageDesc
-	pd, err = bt.s.readPage(pgId)
+	pd, err = bt.s.readPage(tx.header, pgId)
 	if err != nil {
 		return
 	}
@@ -473,7 +480,7 @@ func (bt *BTreeDisk[K, V]) allocNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) 
 	if err != nil {
 		return
 	}
-	pd, err = bt.s.readPage(res[0])
+	pd, err = bt.s.readPage(tx.header, res[0])
 	if err != nil {
 		return
 	}
@@ -696,7 +703,7 @@ func (bt *BTreeDisk[K, V]) writeKeywordDataToNode(tx *Tx[K, V], node *nodeDiskDe
 				if err != nil {
 					return err
 				}
-				newPage, err = bt.s.readPage(res[0])
+				newPage, err = bt.s.readPage(tx.header, res[0])
 				if err != nil {
 					return err
 				}
@@ -776,7 +783,7 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 
 func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], root *nodeDiskDesc, key, val []byte) (bool, bool, error) {
 	index, found := slices.BinarySearchFunc(root.memKeywords, key, func(a keywordDisk, b []byte) int {
-		return bytes.Compare(a.key, b)
+		return bt.c.Comparator(a.key, b)
 	})
 	if found {
 		root.memKeywords[index].val = val
@@ -898,7 +905,7 @@ func (bt *BTreeDisk[K, V]) get(tx *Tx[K, V], key []byte) (val []byte, found bool
 
 func (bt *BTreeDisk[K, V]) findNode(tx *Tx[K, V], root *nodeDiskDesc, s *stack, key []byte) (*nodeDiskDesc, int, error) {
 	index, found := slices.BinarySearchFunc(root.memKeywords, key, func(a keywordDisk, b []byte) int {
-		return bytes.Compare(a.key, b)
+		return bt.c.Comparator(a.key, b)
 	})
 	if s != nil {
 		s.push(stackElement{
@@ -912,11 +919,7 @@ func (bt *BTreeDisk[K, V]) findNode(tx *Tx[K, V], root *nodeDiskDesc, s *stack, 
 		if root.isLeaf() {
 			return nil, -1, nil
 		} else {
-			pd, err := bt.s.readPage(root.subNodes[index])
-			if err != nil {
-				return nil, -1, err
-			}
-			subNode, err := bt.loadNode(tx, pd)
+			subNode, err := bt.loadNodeWithPageId(tx, root.subNodes[index])
 			if err != nil {
 				return nil, -1, err
 			}
@@ -944,12 +947,7 @@ func (bt *BTreeDisk[K, V]) maxKeyWithNode(tx *Tx[K, V], root *nodeDiskDesc) (key
 			break
 		}
 		// 子节点总是比关键字的数量多1, 有子节点的情况下
-		var pd pageDesc
-		pd, err = bt.s.readPage(root.subNodes[len(root.memKeywords)])
-		if err != nil {
-			return
-		}
-		root, err = bt.loadNode(tx, pd)
+		root, err = bt.loadNodeWithPageId(tx, root.subNodes[len(root.subNodes)-1])
 		if err != nil {
 			return
 		}
@@ -976,12 +974,7 @@ func (bt *BTreeDisk[K, V]) minKeyWithNode(tx *Tx[K, V], root *nodeDiskDesc) (key
 			break
 		}
 		// 子节点总是比关键字的数量多1, 有子节点的情况下
-		var pd pageDesc
-		pd, err = bt.s.readPage(root.subNodes[0])
-		if err != nil {
-			return
-		}
-		root, err = bt.loadNode(tx, pd)
+		root, err = bt.loadNodeWithPageId(tx, root.subNodes[0])
 		if err != nil {
 			return
 		}
@@ -1004,7 +997,7 @@ func (bt *BTreeDisk[K, V]) treeRange(tx *Tx[K, V], start []byte, fn func(key, va
 
 func (bt *BTreeDisk[K, V]) doRange(tx *Tx[K, V], root *nodeDiskDesc, s *stack, start []byte, fn func(key, val []byte) bool) error {
 	index, found := slices.BinarySearchFunc(root.memKeywords, start, func(a keywordDisk, b []byte) int {
-		return bytes.Compare(a.key, b)
+		return bt.c.Comparator(a.key, b)
 	})
 	if !found {
 		if root.isLeaf() {

@@ -1,6 +1,7 @@
 package sokv
 
 import (
+	"encoding/binary"
 	"encoding/json"
 )
 
@@ -23,6 +24,18 @@ func (b BytesCodec) Unmarshal(data []byte, v *[]byte) error {
 
 func (b BytesCodec) Marshal(v *[]byte) ([]byte, error) {
 	return *v, nil
+}
+
+type Uint64Codec struct{}
+
+func (u Uint64Codec) Unmarshal(data []byte, v *uint64) error {
+	*v = binary.BigEndian.Uint64(data)
+	return nil
+}
+
+func (u Uint64Codec) Marshal(v *uint64) (b []byte, err error) {
+	b = binary.BigEndian.AppendUint64(b, *v)
+	return
 }
 
 type JsonTypeCodec[T any] struct{}

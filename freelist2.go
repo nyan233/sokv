@@ -62,13 +62,13 @@ func (p *freelist2Pos) setWithIdx(txh *txHeader, innerIdx uint64, v pageId) erro
 type freelist2 struct {
 	file  *os.File
 	opt   *pageStorageOption
-	cache *pageCache
+	cache pageCacheI
 }
 
 func newFreelist2(opt *pageStorageOption) *freelist2 {
 	return &freelist2{
 		opt:   opt,
-		cache: newPageCache(opt.FreelistMaxCacheSize),
+		cache: newLFUCache(opt.FreelistMaxCacheSize),
 	}
 }
 
@@ -105,19 +105,39 @@ func (f *freelist2) initFile() (err error) {
 }
 
 func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err error) {
-	cp, found := f.cache.readPage(pageId)
-	if found {
-		return cp.data, nil
+	if txh.isWriteTx() {
+		cp, found := txh.getPage(freelistShadowPage, pageId)
+		if found {
+			return cp.data, nil
+		}
+		cp, found = f.cache.getAndLockPage(pageId)
+		if found {
+			return cp.data, nil
+		}
+		buf, err = f.readRawPage(pageId)
+		if err != nil {
+			return
+		}
+		f.cache.putAndLockPage(pageId, cachePage{
+			txSeq: txh.seq,
+			data:  buf,
+			pgId:  createPageIdFromUint64(pageId),
+		})
+	} else {
+		cp, found := f.cache.getPage(pageId)
+		if found {
+			return cp.data, nil
+		}
+		buf, err = f.readRawPage(pageId)
+		if err != nil {
+			return
+		}
+		f.cache.putPage(pageId, cachePage{
+			txSeq: txh.seq,
+			data:  buf,
+			pgId:  createPageIdFromUint64(pageId),
+		})
 	}
-	buf, err = f.readRawPage(pageId)
-	if err != nil {
-		return
-	}
-	f.cache.setReadValue(cachePage{
-		txSeq: txh.seq,
-		data:  buf,
-		pgId:  createPageIdFromUint64(pageId),
-	})
 	return
 }
 
@@ -136,12 +156,13 @@ func (f *freelist2) readRawPage(pageId uint64) ([]byte, error) {
 }
 
 func (f *freelist2) writePage(txh *txHeader, pageId uint64, buf []byte) error {
-	// 初始化时直接写并设置脏页
-	f.cache.setDirtyPage(cachePage{
-		txSeq: txh.seq,
-		data:  buf,
-		pgId:  createPageIdFromUint64(pageId),
-	})
+	if txh.isWriteTx() {
+		txh.updatePage(freelistShadowPage, pageId, cachePage{
+			txSeq: txh.seq,
+			data:  buf,
+			pgId:  createPageIdFromUint64(pageId),
+		})
+	}
 	if txh.seq == 0 {
 		return f.writeRawPage(pageId, buf)
 	} else {

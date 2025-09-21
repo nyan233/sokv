@@ -167,7 +167,7 @@ type pageStorage struct {
 	file     *os.File
 	opt      *pageStorageOption
 	freelist *freelist2
-	cache    *pageCache
+	cache    pageCacheI
 	cipher   Cipher
 }
 
@@ -181,7 +181,7 @@ func newPageStorage(opt *pageStorageOption) *pageStorage {
 	}
 	return &pageStorage{
 		opt:    opt,
-		cache:  newPageCache(opt.MaxCacheSize),
+		cache:  newLFUCache(opt.MaxCacheSize),
 		cipher: opt.PageCipher,
 	}
 }
@@ -207,7 +207,7 @@ func (m *pageStorage) init() (err error) {
 		return
 	}
 	var md metadata
-	md, err = m.getMetadata(false)
+	md, err = m.getMetadata(nil, false)
 	if err != nil {
 		return
 	}
@@ -224,7 +224,7 @@ func (m *pageStorage) initFile() (err error) {
 	}
 	// init metadata
 	var md metadata
-	md, err = m.getMetadata(true)
+	md, err = m.getMetadata(nil, true)
 	if err != nil {
 		return
 	}
@@ -260,11 +260,17 @@ func (m *pageStorage) initFile() (err error) {
 	return m.freelist.build(&txHeader{seq: 0}, pgIdList)
 }
 
-func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
+func (m *pageStorage) getMetadata(txh *txHeader, isInit bool) (metadata, error) {
 	var (
-		md metadata
+		md         metadata
+		cacheGetFn = m.cache.getPage
+		cacheSetFn = m.cache.putPage
 	)
-	cp, found := m.cache.readPage(0)
+	if txh != nil && txh.isWriteTx() {
+		cacheGetFn = m.cache.getAndLockPage
+		cacheSetFn = m.cache.putAndLockPage
+	}
+	cp, found := cacheGetFn(0)
 	if found {
 		md.parse(cp.data)
 		return md, nil
@@ -292,7 +298,7 @@ func (m *pageStorage) getMetadata(isInit bool) (metadata, error) {
 		}
 		md.parse(rawPage)
 	}
-	m.cache.setReadValue(cachePage{
+	cacheSetFn(0, cachePage{
 		txSeq: 0,
 		data:  md.rawBuf,
 		pgId:  createPageIdFromUint64(0),
@@ -335,9 +341,9 @@ func (m *pageStorage) close() (err error) {
 	return
 }
 
-func (m *pageStorage) readRootPage() (pgId pageId, err error) {
+func (m *pageStorage) readRootPage(txh *txHeader) (pgId pageId, err error) {
 	var md metadata
-	md, err = m.getMetadata(false)
+	md, err = m.getMetadata(txh, false)
 	if err != nil {
 		return
 	} else {
@@ -350,10 +356,10 @@ func (m *pageStorage) setRootPage(txh *txHeader, pgId pageId) error {
 }
 
 func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) error {
-	if txh.seq == 0 {
-		return fmt.Errorf("invalid tx seq: %d", txh.seq)
+	if txh.isWriteTx() {
+		return fmt.Errorf("current tx type not is write")
 	}
-	md, err := m.getMetadata(false)
+	md, err := m.getMetadata(txh, false)
 	if err != nil {
 		return err
 	}
@@ -370,7 +376,7 @@ func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) erro
 	if err != nil {
 		return err
 	}
-	m.cache.setDirtyPage(cachePage{
+	txh.updatePage(storageShadowPage, 0, cachePage{
 		txSeq: txh.seq,
 		data:  md.rawBuf,
 		pgId:  pgId,
@@ -380,7 +386,7 @@ func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) erro
 
 // NOTE: 不允许在事务中执行, 会直接写原始页, 一般只用于初始化时设置配置
 func (m *pageStorage) setLocalData(b []byte) error {
-	md, err := m.getMetadata(false)
+	md, err := m.getMetadata(nil, false)
 	if err != nil {
 		return err
 	}
@@ -392,7 +398,7 @@ func (m *pageStorage) setLocalData(b []byte) error {
 	copy(md.data, b)
 	md.writeHeader2RawBuf()
 	pgId := createPageIdFromUint64(0)
-	m.cache.setDirtyPage(cachePage{
+	m.cache.putPage(0, cachePage{
 		txSeq: 0,
 		data:  md.rawBuf,
 		pgId:  pgId,
@@ -401,7 +407,7 @@ func (m *pageStorage) setLocalData(b []byte) error {
 }
 
 func (m *pageStorage) loadLocalData() ([]byte, error) {
-	md, err := m.getMetadata(false)
+	md, err := m.getMetadata(nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -411,8 +417,8 @@ func (m *pageStorage) loadLocalData() ([]byte, error) {
 }
 
 func (m *pageStorage) writePage(txh *txHeader, pd pageDesc) error {
-	if txh.seq == 0 {
-		return fmt.Errorf("invalid tx seq: %d", pd.TxSeq)
+	if txh.isWriteTx() {
+		return fmt.Errorf("current tx type not is write")
 	}
 	pd.writeHeader2RawBuf()
 	cpDat := make([]byte, pd.minSize())
@@ -427,7 +433,7 @@ func (m *pageStorage) writePage(txh *txHeader, pd pageDesc) error {
 	if err != nil {
 		return err
 	}
-	m.cache.setDirtyPage(cachePage{
+	txh.updatePage(storageShadowPage, pd.Header.PgId.ToUint64(), cachePage{
 		txSeq: txh.seq,
 		data:  pd.rawBuf,
 		pgId:  pd.Header.PgId,
@@ -494,12 +500,25 @@ func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
 	return buf, nil
 }
 
-func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
+func (m *pageStorage) readPage(txh *txHeader, pgId pageId) (pd pageDesc, err error) {
 	if pgId.ToUint64() < 2 {
 		err = fmt.Errorf("read page type not is dat : %d", pgId.ToUint64())
 		return
 	}
-	cp, found := m.cache.readPage(pgId.ToUint64())
+	var (
+		cp         cachePage
+		found      bool
+		cacheGetFn = m.cache.getPage
+		cacheSetFn = m.cache.putPage
+	)
+	if txh.isWriteTx() {
+		cp, found = txh.getPage(storageShadowPage, pgId.ToUint64())
+		cacheGetFn = m.cache.getAndLockPage
+		cacheSetFn = m.cache.putAndLockPage
+	}
+	if !found {
+		cp, found = cacheGetFn(pgId.ToUint64())
+	}
 	if found {
 		pd.parse(cp.data)
 	} else {
@@ -517,7 +536,7 @@ func (m *pageStorage) readPage(pgId pageId) (pd pageDesc, err error) {
 		}
 	}
 	if !found {
-		m.cache.setReadValue(cachePage{
+		cacheSetFn(pgId.ToUint64(), cachePage{
 			txSeq: 0,
 			data:  pd.rawBuf,
 			pgId:  pgId,
@@ -545,7 +564,10 @@ func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) (err error) {
 	}
 }
 
-func (m *pageStorage) deleteAllDirtyPage() {
-	m.cache.delAllDirtyPage()
-	m.freelist.cache.delAllDirtyPage()
+func (m *pageStorage) opFreelist(fn func(v *freelist2) error) error {
+	if fn != nil {
+		return fn(m.freelist)
+	} else {
+		return nil
+	}
 }

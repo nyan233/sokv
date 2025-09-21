@@ -37,7 +37,7 @@ func TestBTree(t *testing.T) {
 			//	return NewAseCipher(key)
 			//},
 		})
-		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
+		bt.SetKeyCodec(new(Uint64Codec))
 		bt.SetValCodec(new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
@@ -67,10 +67,31 @@ func TestBTree(t *testing.T) {
 			v, found, err := tx.Get(1022)
 			require.NoError(t, err)
 			require.False(t, found)
+			v, found, err = tx.Get(1024)
+			require.NoError(t, err)
+			require.True(t, found)
 			v, found, err = tx.Get(512)
 			require.NoError(t, err)
 			require.True(t, found)
 			require.Equal(t, "hello world", v)
+			minKey, err := tx.MinKey()
+			require.NoError(t, err)
+			require.Equal(t, uint64(0), minKey)
+			maxKey, err := tx.MaxKey()
+			require.NoError(t, err)
+			require.Equal(t, uint64(1024), maxKey)
+			var offset uint64
+			err = tx.Range(512, func(k uint64, v string) bool {
+				// 删除了1022
+				if k == 1023 {
+					offset++
+				}
+				require.Equal(t, 512+offset, k)
+				require.Equal(t, v, "hello world")
+				offset++
+				return true
+			})
+			require.NoError(t, err)
 			_, err = tx.Put(10010, "hello world")
 			require.Error(t, err)
 			return nil
@@ -85,7 +106,7 @@ func TestBTree(t *testing.T) {
 			MaxPageCacheSize:         1024 * 1024,
 			MaxFreeListPageCacheSize: 1024 * 1024,
 		})
-		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
+		bt.SetKeyCodec(new(Uint64Codec))
 		bt.SetValCodec(new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		for i := 0; i < 128; i++ {
