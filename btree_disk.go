@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -70,6 +71,10 @@ type nodeDiskDesc struct {
 	keywordsPageView []keywordDiskDesc
 	// 在内存中的keywords, 修改后需要将其刷到磁盘中
 	memKeywords []keywordDisk
+}
+
+func (node *nodeDiskDesc) getPageId() pageId {
+	return node.pageLink[0].Header.PgId
 }
 
 func (node *nodeDiskDesc) sumKeywordDiskOff(idx int) (off uint32) {
@@ -233,17 +238,7 @@ func (bt *BTreeDisk[K, V]) Init() error {
 }
 
 func (bt *BTreeDisk[K, V]) crashRecovery(recordLog *os.File) error {
-	var (
-		tx = &Tx[K, V]{
-			header: &txHeader{
-				records:                 make([]pageRecord, 0, 16),
-				storagePageChangeRecord: make(map[uint64][]pageRecord, 16),
-				freePageChangeRecord:    make(map[uint64][]pageRecord, 16),
-			},
-			tree:      bt,
-			recordLog: recordLog,
-		}
-	)
+	tx := newTx(bt)
 	buf, err := io.ReadAll(recordLog)
 	if err != nil {
 		return err
@@ -331,16 +326,11 @@ func (bt *BTreeDisk[K, V]) doWritePageData(tx *Tx[K, V], isRecovery bool) error 
 }
 
 func (bt *BTreeDisk[K, V]) BeginOnlyReadTx(logic func(tx *Tx[K, V]) error) (err error) {
-	tx := &Tx[K, V]{
-		header: &txHeader{
-			seq:        bt.txSeq.Load(),
-			isRead:     true,
-			isRollback: false,
-			isCommit:   false,
-		},
-		tree:      bt,
-		recordLog: bt.recordLogFile,
-	}
+	tx := newTx(bt)
+	tx.header.seq = bt.txSeq.Load()
+	tx.header.isRead = true
+	tx.header.isRollback = false
+	tx.header.isCommit = false
 	err = tx.begin()
 	if err != nil {
 		return
@@ -353,16 +343,8 @@ func (bt *BTreeDisk[K, V]) BeginOnlyReadTx(logic func(tx *Tx[K, V]) error) (err 
 }
 
 func (bt *BTreeDisk[K, V]) BeginWriteTx(logic func(tx *Tx[K, V]) error) (err error) {
-	tx := &Tx[K, V]{
-		header: &txHeader{
-			seq:        bt.txSeq.Add(1),
-			isRead:     false,
-			isRollback: false,
-			isCommit:   false,
-		},
-		tree:      bt,
-		recordLog: bt.recordLogFile,
-	}
+	tx := newTx(bt)
+	tx.header.seq = bt.txSeq.Add(1)
 	err = tx.begin()
 	if err != nil {
 		return err
@@ -376,6 +358,17 @@ func (bt *BTreeDisk[K, V]) BeginWriteTx(logic func(tx *Tx[K, V]) error) (err err
 		return err
 	}
 	return tx.commit()
+}
+
+func (bt *BTreeDisk[K, V]) doLogic(tx *Tx[K, V], logic func(tx *Tx[K, V]) error) (err error) {
+	defer func() {
+		v := recover()
+		if v != nil {
+			bt.logger.Error("Tx logic panic", "err", v)
+			debug.PrintStack()
+		}
+	}()
+	return logic(tx)
 }
 
 func (bt *BTreeDisk[K, V]) loadRootNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) {
@@ -399,7 +392,7 @@ func (bt *BTreeDisk[K, V]) loadRootNode(tx *Tx[K, V]) (d *nodeDiskDesc, err erro
 			Flags:  0,
 		}
 		// 写事务的话写一下数据到脏页, 只读事务就算了
-		if !tx.isReadOnly() {
+		if tx.header.isWriteTx() {
 			err = bt.s.writePage(tx.header, pd)
 			if err != nil {
 				return
@@ -503,6 +496,7 @@ func (bt *BTreeDisk[K, V]) freeNode(tx *Tx[K, V], node *nodeDiskDesc) (err error
 	}
 	err = bt.flushSubNodes(tx, node)
 	if err != nil {
+		err = fmt.Errorf("freeNode err: %v", err)
 		return
 	}
 	//for {
@@ -524,7 +518,13 @@ func (bt *BTreeDisk[K, V]) freeNode(tx *Tx[K, V], node *nodeDiskDesc) (err error
 	for i := 0; i < len(node.pageLink); i++ {
 		allPage = append(allPage, node.pageLink[i].Header.PgId)
 	}
-	return bt.s.freePage(tx.header, allPage)
+	err = bt.s.freePage(tx.header, allPage)
+	if err != nil {
+		err = fmt.Errorf("freeNode err: %v", err)
+		return
+	} else {
+		return
+	}
 }
 
 // NOTE: flushSubNodes全量覆写, 避免旧节点的脏数据
@@ -737,39 +737,28 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 		})
 		return false, bt.flushNodeKeywords(tx, root, 0, false)
 	}
-	isReplace, isFull, err := bt.doPut(tx, root, key, val)
+	s := new(stack)
+	isReplace, err := bt.doPut(tx, s, root, key, val)
 	if err != nil {
 		return false, err
 	}
-	if isFull {
-		mediumElem, left, right, err := bt.splitNode(tx, root)
-		if err != nil {
-			return false, err
+	for s.peek().node != nil {
+		var (
+			elem       = s.pop()
+			curNode    = elem.node
+			peekParent = s.peek()
+			parentNode = peekParent.node
+			isRoot     = false
+		)
+		// root节点已满
+		if parentNode == nil {
+			isRoot = true
 		}
-		newRoot, err := bt.allocNode(tx)
-		if err != nil {
-			return false, err
-		}
-		newRoot.memKeywords = append(newRoot.memKeywords, mediumElem)
-		newRoot.subNodes = append(newRoot.subNodes, left.pageLink[0].Header.PgId)
-		newRoot.subNodes = append(newRoot.subNodes, right.pageLink[0].Header.PgId)
-		err = bt.flushSubNodes(tx, newRoot)
-		if err != nil {
-			return false, err
-		}
-		err = bt.flushNodeKeywords(tx, newRoot, 0, false)
-		if err != nil {
-			return false, err
-		}
-		err = bt.freeNode(tx, root)
-		if err != nil {
-			return false, err
-		}
-		// 重新设置根节点
-
-		err = bt.s.setRootPage(tx.header, newRoot.pageLink[0].Header.PgId)
-		if err != nil {
-			return false, err
+		if bt.nodeEQMax(curNode) {
+			err = bt.splitNode(tx, isRoot, parentNode, curNode, int(peekParent.tag))
+			if err != nil {
+				return false, err
+			}
 		}
 	}
 	if !isReplace {
@@ -778,17 +767,60 @@ func (bt *BTreeDisk[K, V]) put(tx *Tx[K, V], key, val []byte) (bool, error) {
 	return isReplace, nil
 }
 
-func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], root *nodeDiskDesc, key, val []byte) (bool, bool, error) {
+func (bt *BTreeDisk[K, V]) splitNode(tx *Tx[K, V], isRoot bool, parentNode, curNode *nodeDiskDesc, parentIdx int) error {
+	mediumElem, left, right, err := bt.splitNode2(tx, curNode)
+	if err != nil {
+		return err
+	}
+	var isFreeCurNode bool
+	// 分裂到root节点了
+	// 2025/09/27 NOTE: 不再分配新的Root节点, 直接往旧的Root节点写数据
+	if isRoot {
+		parentNode = curNode
+		parentNode.subNodes = parentNode.subNodes[:bt.c.TreeM]
+		clear(parentNode.subNodes)
+		parentNode.memKeywords = parentNode.memKeywords[:0]
+		parentNode.memKeywords = append(parentNode.memKeywords, mediumElem)
+		parentNode.subNodes[0] = left.getPageId()
+		parentNode.subNodes[1] = right.getPageId()
+	} else {
+		parentNode.memKeywords = slices.Insert(parentNode.memKeywords, parentIdx, mediumElem)
+		parentNode.subNodes[parentIdx] = left.getPageId()
+		parentNode.subNodes = slices.Insert(parentNode.subNodes, parentIdx+1, right.getPageId())
+		isFreeCurNode = true
+	}
+	err = bt.flushSubNodes(tx, parentNode)
+	if err != nil {
+		return err
+	}
+	err = bt.flushNodeKeywords(tx, parentNode, parentIdx, false)
+	if err != nil {
+		return err
+	}
+	if isFreeCurNode {
+		return bt.freeNode(tx, curNode)
+	} else {
+		return nil
+	}
+}
+
+func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], s *stack, root *nodeDiskDesc, key, val []byte) (bool, error) {
 	index, found := slices.BinarySearchFunc(root.memKeywords, key, func(a keywordDisk, b []byte) int {
 		return bt.c.Comparator(a.key, b)
 	})
+	if s != nil {
+		s.push(stackElement{
+			node: root,
+			tag:  uint64(index),
+		})
+	}
 	if found {
 		root.memKeywords[index].val = val
 		err := bt.flushNodeKeywords(tx, root, index, false)
 		if err != nil {
-			return false, false, err
+			return false, err
 		}
-		return true, false, nil
+		return true, nil
 	}
 	if root.isLeaf() {
 		root.memKeywords = slices.Insert(root.memKeywords, index, keywordDisk{
@@ -797,45 +829,23 @@ func (bt *BTreeDisk[K, V]) doPut(tx *Tx[K, V], root *nodeDiskDesc, key, val []by
 		})
 		err := bt.flushNodeKeywords(tx, root, index, false)
 		if err != nil {
-			return false, false, err
+			return false, err
 		}
-		return false, bt.nodeEQMax(root), nil
+		return false, nil
 	} else {
 		subNode, err := bt.loadNodeWithPageId(tx, root.subNodes[index])
 		if err != nil {
-			return false, false, err
+			return false, err
 		}
-		isReplace, isFull, err := bt.doPut(tx, subNode, key, val)
+		isReplace, err := bt.doPut(tx, s, subNode, key, val)
 		if err != nil {
-			return false, false, err
+			return false, err
 		}
-		// do split
-		if isFull {
-			mediumElem, left, right, err := bt.splitNode(tx, subNode)
-			if err != nil {
-				return false, false, err
-			}
-			root.memKeywords = slices.Insert(root.memKeywords, index, mediumElem)
-			root.subNodes[index] = left.pageLink[0].Header.PgId
-			root.subNodes = slices.Insert(root.subNodes, index+1, right.pageLink[0].Header.PgId)
-			err = bt.flushSubNodes(tx, root)
-			if err != nil {
-				return false, false, err
-			}
-			err = bt.flushNodeKeywords(tx, root, index, false)
-			if err != nil {
-				return false, false, err
-			}
-			err = bt.freeNode(tx, subNode)
-			if err != nil {
-				return false, false, fmt.Errorf("freeNode err: %v", err)
-			}
-		}
-		return isReplace, bt.nodeEQMax(root), nil
+		return isReplace, nil
 	}
 }
 
-func (bt *BTreeDisk[K, V]) splitNode(tx *Tx[K, V], root *nodeDiskDesc) (medium keywordDisk, s1, s2 *nodeDiskDesc, err error) {
+func (bt *BTreeDisk[K, V]) splitNode2(tx *Tx[K, V], root *nodeDiskDesc) (medium keywordDisk, s1, s2 *nodeDiskDesc, err error) {
 	//medium = root.keywords[len(root.keywords)/2]
 	//s1 = &btNode[K, V]{
 	//	keywords: root.keywords[:len(root.keywords)/2],

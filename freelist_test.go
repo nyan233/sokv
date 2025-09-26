@@ -1,7 +1,6 @@
 package sokv
 
 import (
-	"github.com/nyan233/sokv/internal/sys"
 	"github.com/stretchr/testify/require"
 	"path"
 	"testing"
@@ -11,7 +10,6 @@ func TestFreelist(t *testing.T) {
 	initTest(t)
 	f := newFreelist2(&pageStorageOption{
 		FreelistPath:         path.Join("testdata", "testbt.freelist"),
-		PageSize:             uint32(sys.GetSysPageSize()),
 		MaxCacheSize:         1024,
 		FreelistMaxCacheSize: 1024,
 	})

@@ -29,6 +29,13 @@ var (
 	medataHeader = [4]byte{'c', 'a', 'f', 'e'}
 )
 
+func init() {
+	sysPageSize := sys.GetSysPageSize()
+	if recordSize%sysPageSize != 0 {
+		panic(fmt.Sprintf("recordSize(%d) must be a multiple of sysPageSize(%d)", recordSize, sysPageSize))
+	}
+}
+
 type metaHeader struct {
 	header       [4]byte
 	sum          uint32
@@ -243,7 +250,7 @@ func (m *pageStorage) initFile() (err error) {
 	for i := 3; i < defaultPageCount; i++ {
 		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
 	}
-	return m.freelist.build(&txHeader{seq: 0}, pgIdList)
+	return m.freelist.build(nil, pgIdList)
 }
 
 func (m *pageStorage) getMetadata(txh *txHeader, isInit bool) (metadata, error) {
@@ -391,7 +398,7 @@ func (m *pageStorage) loadLocalData() ([]byte, error) {
 }
 
 func (m *pageStorage) writePage(txh *txHeader, pd pageDesc) error {
-	if txh.isWriteTx() {
+	if !txh.isWriteTx() {
 		return fmt.Errorf("current tx type not is write")
 	}
 	pd.writeHeader2RawBuf()

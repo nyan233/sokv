@@ -1,7 +1,6 @@
 package sokv
 
 import (
-	"github.com/nyan233/sokv/internal/sys"
 	"github.com/stretchr/testify/require"
 	"path"
 	"testing"
@@ -12,7 +11,6 @@ func TestStorage(t *testing.T) {
 	s := newPageStorage(&pageStorageOption{
 		DataPath:             path.Join("testdata", "test.storage.dat"),
 		FreelistPath:         path.Join("testdata", "test.storage.dat.freelist"),
-		PageSize:             uint32(sys.GetSysPageSize()),
 		MaxCacheSize:         1024 * 1024,
 		FreelistMaxCacheSize: 1024 * 1024,
 		PageCipher:           nil,

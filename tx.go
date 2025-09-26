@@ -57,6 +57,29 @@ type txHeader struct {
 	shadowPage map[shadowPageKey]cachePage
 }
 
+func newTxHeader() *txHeader {
+	return &txHeader{
+		records:                 make([]pageRecord, 0, 64),
+		storagePageChangeRecord: make(map[uint64][]pageRecord, 16),
+		freePageChangeRecord:    make(map[uint64][]pageRecord, 16),
+		shadowPage:              make(map[shadowPageKey]cachePage, 16),
+	}
+}
+
+func (h *txHeader) valid() bool {
+	if h == nil {
+		return false
+	}
+	if h.isRollback || h.isCommit {
+		return false
+	}
+	if !h.isRead {
+		return h.seq > 0
+	} else {
+		return h.seq >= 0
+	}
+}
+
 func (h *txHeader) isWriteTx() bool {
 	return !h.isRead && h.seq > 0
 }
@@ -119,8 +142,12 @@ type Tx[K any, V any] struct {
 	recordLog *os.File
 }
 
-func (tx *Tx[K, V]) isReadOnly() bool {
-	return tx.header.isRead
+func newTx[K any, V any](bt *BTreeDisk[K, V]) *Tx[K, V] {
+	return &Tx[K, V]{
+		header:    newTxHeader(),
+		tree:      bt,
+		recordLog: bt.recordLogFile,
+	}
 }
 
 func (tx *Tx[K, V]) begin() error {

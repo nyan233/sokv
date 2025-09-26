@@ -105,6 +105,10 @@ func (f *freelist2) initFile() (err error) {
 }
 
 func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err error) {
+	if !txh.valid() {
+		buf, err = f.readRawPage(pageId)
+		return
+	}
 	if txh.isWriteTx() {
 		cp, found := txh.getPage(freelistShadowPage, pageId)
 		if found {
@@ -156,6 +160,9 @@ func (f *freelist2) readRawPage(pageId uint64) ([]byte, error) {
 }
 
 func (f *freelist2) writePage(txh *txHeader, pageId uint64, buf []byte) error {
+	if !txh.valid() {
+		return f.writeRawPage(pageId, buf)
+	}
 	if txh.isWriteTx() {
 		txh.updatePage(freelistShadowPage, pageId, cachePage{
 			txSeq: txh.seq,
@@ -163,11 +170,7 @@ func (f *freelist2) writePage(txh *txHeader, pageId uint64, buf []byte) error {
 			pgId:  createPageIdFromUint64(pageId),
 		})
 	}
-	if txh.seq == 0 {
-		return f.writeRawPage(pageId, buf)
-	} else {
-		return nil
-	}
+	return nil
 }
 
 func (f *freelist2) writeRawPage(pageId uint64, buf []byte) error {
@@ -278,7 +281,7 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 			return err
 		}
 		// 非初始化时写入页修改记录
-		if txh.seq > 0 {
+		if txh.valid() {
 			err = txh.addPageModify(pageRecord{
 				typ:  pageRecordFree,
 				pgId: createPageIdFromUint64(uint64(idx)),
