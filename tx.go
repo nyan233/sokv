@@ -145,7 +145,7 @@ func (tx *Tx[K, V]) Rollback() error {
 	}
 	tx.header.records = nil
 	tx.header.isRollback = true
-	defer tx.tree.rw.Unlock()
+	defer tx.tree.txMu.Unlock()
 	return tx.recordLog.Truncate(0)
 }
 
@@ -220,7 +220,7 @@ func (tx *Tx[K, V]) doCommit() error {
 		return fmt.Errorf("write count %d not equal 8", writeCount)
 	}
 	var buf bytes.Buffer
-	buf.Grow(int(tx.tree.s.getPageSize()))
+	buf.Grow(recordSize)
 	for _, record := range tx.header.records {
 		buf.Reset()
 		// 先给header留位置

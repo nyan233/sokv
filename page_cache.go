@@ -237,7 +237,7 @@ func (c *lfuCache) updateFreq(node *lfuNode) {
 	node.freq++
 	if node.freq == 1 {
 		c.minFreq = 1
-	} else if node.freq-1 == c.minFreq && c.freqMap[node.freq-1].head == nil {
+	} else if node.freq == c.minFreq && c.freqMap[node.freq].head == nil {
 		// 寻找新的最小频率（仅考虑未锁定页面）
 		c.updateMinFreq()
 	}

@@ -101,7 +101,7 @@ func (f *freelist2) close() (err error) {
 }
 
 func (f *freelist2) initFile() (err error) {
-	return f.file.Truncate(int64(f.opt.PageSize * 2))
+	return f.file.Truncate(int64(recordSize))
 }
 
 func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err error) {
@@ -142,8 +142,8 @@ func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err erro
 }
 
 func (f *freelist2) readRawPage(pageId uint64) ([]byte, error) {
-	buf := make([]byte, f.opt.PageSize)
-	readCount, err := f.file.ReadAt(buf, int64(pageId)*int64(f.opt.PageSize))
+	buf := make([]byte, recordSize)
+	readCount, err := f.file.ReadAt(buf, int64(pageId)*int64(recordSize))
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (f *freelist2) writePage(txh *txHeader, pageId uint64, buf []byte) error {
 }
 
 func (f *freelist2) writeRawPage(pageId uint64, buf []byte) error {
-	writeCount, err := f.file.WriteAt(buf, int64(pageId)*int64(f.opt.PageSize))
+	writeCount, err := f.file.WriteAt(buf, int64(pageId)*int64(recordSize))
 	if err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func (f *freelist2) position(txh *txHeader, globalIdx uint64) (*freelist2Pos, er
 	pos.f = f
 	pos.globalIdx = globalIdx
 	// 第一个页的第一个值是用来存储length的, 并不是真实的值
-	pageIdCount := uint64(f.opt.PageSize) / uint64(pgIdMemSize)
+	pageIdCount := uint64(recordSize) / uint64(pgIdMemSize)
 	pos.pgId = globalIdx / pageIdCount
 	pos.innerIdx = globalIdx % pageIdCount
 	pos.buf, err = f.readPage(txh, pos.pgId)
@@ -213,13 +213,13 @@ func (f *freelist2) growFile() (err error) {
 }
 
 func (f *freelist2) isFull(length uint64) (bool, error) {
-	pageIdCount := uint64(f.opt.PageSize / uint32(pgIdMemSize))
+	pageIdCount := uint64(recordSize / uint32(pgIdMemSize))
 	requirePage := length / pageIdCount
 	stat, err := f.file.Stat()
 	if err != nil {
 		return false, err
 	}
-	if int64(requirePage*uint64(f.opt.PageSize)) > stat.Size() {
+	if int64(requirePage*uint64(recordSize)) > stat.Size() {
 		return true, nil
 	} else {
 		return false, nil
@@ -236,7 +236,7 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 	// 分组写入
 	var (
 		idx         int
-		pageIdCount = f.opt.PageSize / uint32(pgIdMemSize)
+		pageIdCount = recordSize / uint32(pgIdMemSize)
 		buf         []byte
 	)
 	for len(pgIdList) > 0 {
@@ -245,7 +245,7 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 		if err != nil {
 			return
 		}
-		if stat.Size() <= int64(idx)*int64(f.opt.PageSize) {
+		if stat.Size() <= int64(idx)*int64(recordSize) {
 			err = f.growFile()
 			if err != nil {
 				return

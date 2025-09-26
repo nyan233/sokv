@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"github.com/nyan233/sokv/internal/sys"
 	"hash/crc32"
 	"io"
 	"log/slog"
@@ -177,7 +176,6 @@ func (bt *BTreeDisk[K, V]) Init() error {
 	bt.s = newPageStorage(&pageStorageOption{
 		DataPath:             bt.getFilePath(".dat"),
 		FreelistPath:         bt.getFilePath(".freelist"),
-		PageSize:             uint32(sys.GetSysPageSize()),
 		MaxCacheSize:         bt.c.MaxPageCacheSize,
 		FreelistMaxCacheSize: bt.c.MaxFreeListPageCacheSize,
 		PageCipher:           cipher,
@@ -187,11 +185,10 @@ func (bt *BTreeDisk[K, V]) Init() error {
 	if err != nil {
 		return err
 	}
-	pgSize := bt.s.getPageSize()
 	slotSize := bt.c.TreeM * int(unsafe.Sizeof(pageId{})+8)
 	// 节点分槽占用的空间比一个页还要大
-	if slotSize > int(pgSize) {
-		return fmt.Errorf("slotSize(%d) > pgSize(%d)", slotSize, pgSize)
+	if slotSize > recordSize {
+		return fmt.Errorf("slotSize(%d) > pgSize(%d)", slotSize, recordSize)
 	}
 	localDataBytes, err := bt.s.loadLocalData()
 	if err != nil {
