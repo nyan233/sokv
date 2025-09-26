@@ -1135,7 +1135,7 @@ func (bt *BTreeDisk[K, V]) del(tx *Tx[K, V], key []byte) (val []byte, found bool
 			return
 		}
 		s.pop()
-		err = bt.del2(tx, node, s)
+		err = bt.reblance(tx, node, s)
 		return
 	}
 	node2, err = bt.loadNodeWithPageId(tx, node.subNodes[idx])
@@ -1162,12 +1162,12 @@ func (bt *BTreeDisk[K, V]) del(tx *Tx[K, V], key []byte) (val []byte, found bool
 	if err != nil {
 		return
 	}
-	err = bt.del2(tx, node2, s)
+	err = bt.reblance(tx, node2, s)
 	return
 }
 
 // 处理下溢和连接
-func (bt *BTreeDisk[K, V]) del2(tx *Tx[K, V], leafNode *nodeDiskDesc, s *stack) error {
+func (bt *BTreeDisk[K, V]) reblance(tx *Tx[K, V], leafNode *nodeDiskDesc, s *stack) error {
 	if !(len(leafNode.memKeywords) < bt.c.TreeM/2) {
 		return nil
 	}
