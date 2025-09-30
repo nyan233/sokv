@@ -292,7 +292,11 @@ func (bt *BTreeDisk[K, V]) crashRecovery(recordLog *os.File) error {
 	return bt.doWritePageData(tx, true)
 }
 
-// NOTE : 这里不需要处理扩容, 写脏页时底层文件已经扩容了, 如果这里会触发io.EOF说明文件大小不正确, 这可能是代码的Bug或者底层文件系统的Bug
+/*
+NOTE : 这里不需要处理扩容, 写脏页时底层文件已经扩容了, 如果这里会触发io.EOF说明文件大小不正确,
+
+	这可能是code Bug/fs Bug/也或者可能是提交给hardware的数据并未被写入等等
+*/
 func (bt *BTreeDisk[K, V]) doWritePageData(tx *Tx[K, V], isRecovery bool) error {
 	txh := tx.header
 	for pgId, changeList := range txh.storagePageChangeRecord {
