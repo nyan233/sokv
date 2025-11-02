@@ -208,8 +208,8 @@ func OpenFile(path string) (file *os.File, err error) {
 		pathPtr,
 		windows.GENERIC_READ|windows.GENERIC_WRITE, // 读写权限
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
-		nil,                   // 默认安全属性
-		windows.CREATE_ALWAYS, // 等价于 os.O_CREATE|os.O_TRUNC
+		nil,                 // 默认安全属性
+		windows.OPEN_ALWAYS, // 不存在则新建，存在则打开
 		windows.FILE_FLAG_NO_BUFFERING|windows.FILE_FLAG_WRITE_THROUGH,
 		0, // 无模板文件
 	)
