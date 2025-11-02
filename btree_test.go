@@ -36,9 +36,7 @@ func TestBTree(t *testing.T) {
 			//	}
 			//	return NewAseCipher(key)
 			//},
-		})
-		bt.SetKeyCodec(new(Uint64Codec))
-		bt.SetValCodec(new(JsonTypeCodec[string]))
+		}, new(Uint64Codec), new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
 			for i := 0; i < 1024; i++ {
@@ -105,9 +103,7 @@ func TestBTree(t *testing.T) {
 			TreeM:                    64,
 			MaxPageCacheSize:         1024 * 1024,
 			MaxFreeListPageCacheSize: 1024 * 1024,
-		})
-		bt.SetKeyCodec(new(Uint64Codec))
-		bt.SetValCodec(new(JsonTypeCodec[string]))
+		}, new(Uint64Codec), new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		for i := 0; i < 128; i++ {
 			err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
@@ -127,9 +123,7 @@ func TestBTree(t *testing.T) {
 			TreeM:                    64,
 			MaxPageCacheSize:         1024 * 1024,
 			MaxFreeListPageCacheSize: 1024 * 1024,
-		})
-		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
-		bt.SetValCodec(new(JsonTypeCodec[string]))
+		}, new(Uint64Codec), new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		var (
 			wg    sync.WaitGroup
@@ -159,9 +153,7 @@ func TestBTree(t *testing.T) {
 			TreeM:                    64,
 			MaxPageCacheSize:         1024 * 1024,
 			MaxFreeListPageCacheSize: 1024 * 1024,
-		})
-		bt.SetKeyCodec(new(JsonTypeCodec[uint64]))
-		bt.SetValCodec(new(JsonTypeCodec[string]))
+		}, new(Uint64Codec), new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
 			for i := 0; i < 1024*16; i++ {
@@ -193,9 +185,7 @@ func TestReOpenBtree(t *testing.T) {
 			//	}
 			//	return NewAseCipher(key)
 			//},
-		})
-		bt.SetKeyCodec(new(Uint64Codec))
-		bt.SetValCodec(new(JsonTypeCodec[string]))
+		}, new(Uint64Codec), new(JsonTypeCodec[string]))
 		require.NoError(t, bt.Init())
 		return bt
 	}

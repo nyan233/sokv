@@ -143,18 +143,15 @@ type Config struct {
 	Comparator               func(a, b []byte) int
 }
 
-func NewBTreeDisk[K any, V any](c Config) *BTreeDisk[K, V] {
-	return &BTreeDisk[K, V]{
-		c: c,
+func NewBTreeDisk[K any, V any](c Config, kc Codec[K], vc Codec[V]) *BTreeDisk[K, V] {
+	if kc == nil || vc == nil {
+		panic("invalid codec")
 	}
-}
-
-func (bt *BTreeDisk[K, V]) SetKeyCodec(keyCodec Codec[K]) {
-	bt.keyCodec = keyCodec
-}
-
-func (bt *BTreeDisk[K, V]) SetValCodec(valCodec Codec[V]) {
-	bt.valCodec = valCodec
+	return &BTreeDisk[K, V]{
+		c:        c,
+		keyCodec: kc,
+		valCodec: vc,
+	}
 }
 
 func (bt *BTreeDisk[K, V]) getFilePath(suffix string) string {
@@ -998,8 +995,18 @@ func (bt *BTreeDisk[K, V]) splitNode2(tx *Tx[K, V], root *nodeDiskDesc) (medium 
 	s2.memKeywords = root.memKeywords[len(root.memKeywords)/2+1:]
 	if !root.isLeaf() {
 		rootSubNodes := root.subNodes
-		copy(s1.subNodes, rootSubNodes[:len(rootSubNodes)/2])
-		copy(s2.subNodes, rootSubNodes[len(rootSubNodes)/2:])
+		s1.subNodes = append(s1.subNodes, rootSubNodes[:len(rootSubNodes)/2]...)
+		s2.subNodes = append(s2.subNodes, rootSubNodes[len(rootSubNodes)/2:]...)
+		err = bt.flushSubNodes(tx, s1)
+		if err != nil {
+			errPrint(bt, "splitNode.flushSubNodes", err)
+			return
+		}
+		err = bt.flushSubNodes(tx, s2)
+		if err != nil {
+			errPrint(bt, "splitNode.flushSubNodes", err)
+			return
+		}
 	}
 	err = bt.flushNodeKeywords(tx, s1, 0, false)
 	if err != nil {
