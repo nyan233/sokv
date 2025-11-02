@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -105,19 +106,25 @@ func (node *nodeDiskDesc) delFirstKeyword() keywordDisk {
 	return v
 }
 
+type TxOption struct {
+	IsWriteTx bool
+	// 此选项为True则写事务允许提交读
+	CommitRead bool
+}
+
 type diskLocalData struct {
 	M int `json:"m"`
 }
 
 type BTreeDisk[K any, V any] struct {
 	// 用于保证事务提交时操作pageCache时不会和读者产生冲突
-	rw sync.RWMutex
-	// 用于保证事务隔离级别为可串行的互斥锁
+	rw            sync.RWMutex
 	txMu          sync.Mutex
 	keyCodec      Codec[K]
 	valCodec      Codec[V]
 	size          atomic.Uint64
 	s             *pageStorage
+	freelist      *freelist2
 	c             Config
 	recordLogFile *os.File
 	txSeq         atomic.Uint64
@@ -178,14 +185,20 @@ func (bt *BTreeDisk[K, V]) Init() error {
 			return err
 		}
 	}
-	bt.s = newPageStorage(&pageStorageOption{
+	sOpt := &pageStorageOption{
 		DataPath:             bt.getFilePath(".dat"),
 		FreelistPath:         bt.getFilePath(".freelist"),
 		MaxCacheSize:         bt.c.MaxPageCacheSize,
 		FreelistMaxCacheSize: bt.c.MaxFreeListPageCacheSize,
 		PageCipher:           cipher,
 		Logger:               bt.logger,
-	})
+	}
+	bt.freelist = newFreelist2(sOpt)
+	err = bt.freelist.init()
+	if err != nil {
+		return err
+	}
+	bt.s = newPageStorage(sOpt)
 	err = bt.s.init()
 	if err != nil {
 		return err
@@ -233,6 +246,55 @@ func (bt *BTreeDisk[K, V]) Init() error {
 			return err
 		}
 		return bt.crashRecovery(recordLogFile)
+	}
+	return nil
+}
+
+func (bt *BTreeDisk[K, V]) allocPage(tx *Tx[K, V], n int) (res []pageId, err error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	res = make([]pageId, 0, n)
+	for len(res) < n {
+		var (
+			p pageId
+		)
+		p, err = bt.freelist.pop(tx.header)
+		if err != nil {
+			if errors.Is(err, errNoAvailablePage) {
+				var pgIdList []pageId
+				pgIdList, err = bt.s.grow(tx.header)
+				if err != nil {
+					errPrint(bt, "storage grow fail", err)
+					return res, err
+				}
+				err = bt.freelist.build(tx.header, pgIdList)
+				if err != nil {
+					errPrint(bt, "freelist build fail", err)
+					return res, err
+				}
+				continue
+			} else {
+				return
+			}
+		}
+		res = append(res, p)
+	}
+	return res, nil
+}
+
+func (bt *BTreeDisk[K, V]) freePage(tx *Tx[K, V], pgIdList []pageId) error {
+	for _, pgId := range pgIdList {
+		if pgId.ToUint64() < 2 {
+			panic(fmt.Errorf("free page type not is dat"))
+		}
+	}
+	for _, pgId := range pgIdList {
+		err := bt.freelist.push(tx.header, pgId)
+		if err != nil {
+			errPrint(bt, "free page fail", err)
+			return err
+		}
 	}
 	return nil
 }
@@ -298,70 +360,79 @@ NOTE : 这里不需要处理扩容, 写脏页时底层文件已经扩容了, 如
 	这可能是code Bug/fs Bug/也或者可能是提交给hardware的数据并未被写入等等
 */
 func (bt *BTreeDisk[K, V]) doWritePageData(tx *Tx[K, V], isRecovery bool) error {
-	txh := tx.header
-	for pgId, changeList := range txh.storagePageChangeRecord {
-		rawPage, err := bt.s.readRawPage(createPageIdFromUint64(pgId))
-		if err != nil {
-			return err
-		}
-		for _, change := range changeList {
-			copy(rawPage[change.off:], change.dat)
-		}
-		err = bt.s.writeRawPage(createPageIdFromUint64(pgId), rawPage)
-		if err != nil {
-			return err
-		}
+	//txh := tx.header
+	//for pgId, changeList := range txh.storagePageChangeRecord {
+	//	rawPage, err := bt.s.readRawPage(createPageIdFromUint64(pgId))
+	//	if err != nil {
+	//		return err
+	//	}
+	//	for _, change := range changeList {
+	//		copy(rawPage[change.off:], change.dat)
+	//	}
+	//	err = bt.s.writeRawPage(createPageIdFromUint64(pgId), rawPage)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
+	//for pgId, changeList := range txh.freePageChangeRecord {
+	//	rawPage, err := bt.freelist.readRawPage(pgId)
+	//	if err != nil {
+	//		return err
+	//	}
+	//	for _, change := range changeList {
+	//		copy(rawPage[change.off:], change.dat)
+	//	}
+	//	err = bt.freelist.writeRawPage(pgId, rawPage)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
+	err := bt.flushShadowPage2Disk(tx)
+	if err != nil {
+		errPrint(bt, "bt.doWritePageData", err)
+		return err
 	}
-	for pgId, changeList := range txh.freePageChangeRecord {
-		rawPage, err := bt.s.freelist.readRawPage(pgId)
-		if err != nil {
-			return err
-		}
-		for _, change := range changeList {
-			copy(rawPage[change.off:], change.dat)
-		}
-		err = bt.s.freelist.writeRawPage(pgId, rawPage)
-		if err != nil {
-			return err
-		}
-	}
-	tx.flushAllShadowPage(isRecovery)
+	bt.flushShadowPage(tx, true)
 	return nil
 }
 
-func (bt *BTreeDisk[K, V]) BeginOnlyReadTx(logic func(tx *Tx[K, V]) error) (err error) {
+func (bt *BTreeDisk[K, V]) BeginTx(logic func(tx *Tx[K, V]) error, option *TxOption) error {
 	tx := newTx(bt)
-	tx.header.seq = bt.txSeq.Load()
-	tx.header.isRead = true
-	tx.header.isRollback = false
-	tx.header.isCommit = false
-	err = tx.begin()
-	if err != nil {
-		return
+	if option.IsWriteTx {
+		tx.header.isRead = false
+		tx.header.seq = bt.txSeq.Add(1)
+	} else {
+		tx.header.isRead = true
+		tx.header.seq = bt.txSeq.Load()
 	}
-	err = logic(tx)
-	if err != nil {
-		return
-	}
-	return tx.commit()
-}
-
-func (bt *BTreeDisk[K, V]) BeginWriteTx(logic func(tx *Tx[K, V]) error) (err error) {
-	tx := newTx(bt)
-	tx.header.seq = bt.txSeq.Add(1)
-	err = tx.begin()
+	err := tx.begin()
 	if err != nil {
 		return err
 	}
-	err = logic(tx)
+	err = bt.doLogic(tx, logic)
 	if err != nil {
-		err2 := tx.Rollback()
-		if err2 != nil {
-			return err2
+		if !tx.header.isRead {
+			err2 := tx.Rollback()
+			if err2 != nil {
+				return err2
+			}
 		}
 		return err
 	}
 	return tx.commit()
+}
+
+func (bt *BTreeDisk[K, V]) BeginOnlyReadTx(logic func(tx *Tx[K, V]) error) (err error) {
+	return bt.BeginTx(logic, &TxOption{
+		IsWriteTx:  false,
+		CommitRead: false,
+	})
+}
+
+func (bt *BTreeDisk[K, V]) BeginWriteTx(logic func(tx *Tx[K, V]) error) (err error) {
+	return bt.BeginTx(logic, &TxOption{
+		IsWriteTx: true,
+	})
 }
 
 func (bt *BTreeDisk[K, V]) doLogic(tx *Tx[K, V], logic func(tx *Tx[K, V]) error) (err error) {
@@ -397,7 +468,7 @@ func (bt *BTreeDisk[K, V]) loadRootNode(tx *Tx[K, V]) (d *nodeDiskDesc, err erro
 		}
 		// 写事务的话写一下数据到脏页, 只读事务就算了
 		if tx.header.isWriteTx() {
-			err = bt.s.writePage(tx.header, pd)
+			err = bt.s.flushPageHeader(tx.header, &pd)
 			if err != nil {
 				return
 			}
@@ -470,7 +541,7 @@ func (bt *BTreeDisk[K, V]) allocNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) 
 		res []pageId
 		pd  pageDesc
 	)
-	res, err = bt.s.allocPage(tx.header, 1)
+	res, err = bt.allocPage(tx, 1)
 	if err != nil {
 		return
 	}
@@ -522,7 +593,7 @@ func (bt *BTreeDisk[K, V]) freeNode(tx *Tx[K, V], node *nodeDiskDesc) (err error
 	for i := 0; i < len(node.pageLink); i++ {
 		allPage = append(allPage, node.pageLink[i].Header.PgId)
 	}
-	err = bt.s.freePage(tx.header, allPage)
+	err = bt.freePage(tx, allPage)
 	if err != nil {
 		err = fmt.Errorf("freeNode err: %v", err)
 		return
@@ -533,119 +604,126 @@ func (bt *BTreeDisk[K, V]) freeNode(tx *Tx[K, V], node *nodeDiskDesc) (err error
 
 // NOTE: flushSubNodes全量覆写, 避免旧节点的脏数据
 func (bt *BTreeDisk[K, V]) flushSubNodes(tx *Tx[K, V], node *nodeDiskDesc) (err error) {
-	zeroPgId := createPageIdFromUint64(0)
-	for i := 0; i < bt.c.TreeM; i++ {
-		if i < len(node.subNodes) {
-			copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], node.subNodes[i][:])
-		} else {
-			copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], zeroPgId[:])
+	// 要修改的页分裂成影子页
+	return bt.s.modifyPage(tx.header, node.pageLink[0], func(pd pageDesc) (pageDesc, error) {
+		zeroPgId := createPageIdFromUint64(0)
+		for i := 0; i < bt.c.TreeM; i++ {
+			if i < len(node.subNodes) {
+				copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], node.subNodes[i][:])
+			} else {
+				copy(node.pageLink[0].Data[i*int(pgIdMemSize):(i+1)*int(pgIdMemSize)], zeroPgId[:])
+			}
 		}
-	}
-	cpDat := make([]byte, bt.c.TreeM*int(pgIdMemSize))
-	copy(cpDat, node.pageLink[0].Data)
-	err = tx.addPageModify(pageRecord{
-		typ:  pageRecordStorage,
-		pgId: node.pageLink[0].Header.PgId,
-		off:  node.pageLink[0].minSize(),
-		dat:  cpDat,
+		cpDat := make([]byte, bt.c.TreeM*int(pgIdMemSize))
+		copy(cpDat, node.pageLink[0].Data)
+		err := tx.addPageModify(pageRecord{
+			typ:  pageRecordStorage,
+			pgId: node.pageLink[0].Header.PgId,
+			off:  node.pageLink[0].minSize(),
+			dat:  cpDat,
+		})
+		if err != nil {
+			return pageDesc{}, err
+		} else {
+			return node.pageLink[0], nil
+		}
+	})
+}
+
+func (bt *BTreeDisk[K, V]) flushNodeKeywords(tx *Tx[K, V], node *nodeDiskDesc, idx int, onlyFlushLen bool) (err error) {
+	// 要修改的页分裂成影子页
+	// bt.addShadowPageWithPd(tx, node.pageLink[0])
+	var afterWriter func() error
+	err = bt.s.modifyPage(tx.header, node.pageLink[0], func(pd pageDesc) (pageDesc, error) {
+		// 仅刷新长度信息
+		if onlyFlushLen {
+			keywordLen := uint32(len(node.memKeywords))
+			node.pageLink[0].SetFlags(uint64(keywordLen))
+			return node.pageLink[0], nil
+		} else {
+			// 判断写入模式
+			// 3种情况, 内存中的值比磁盘中的少/跟磁盘的数量一样/比磁盘中的多, 一一处理
+			if len(node.memKeywords) > len(node.keywordsPageView) {
+				// 偏移必须在磁盘视图之内
+				if !(idx <= len(node.keywordsPageView)) {
+					return pageDesc{}, fmt.Errorf("memKeywords flush index overflow : %d", len(node.memKeywords)-1)
+				}
+				diskPageViewLen := len(node.keywordsPageView)
+				memKeywordLen := len(node.memKeywords)
+				for i := 0; i < memKeywordLen-diskPageViewLen; i++ {
+					node.keywordsPageView = append(node.keywordsPageView, keywordDiskDesc{})
+				}
+				var buf bytes.Buffer
+				for i := idx; i < len(node.memKeywords); i++ {
+					key := node.memKeywords[i].key
+					val := node.memKeywords[i].val
+					kw := keywordDiskDesc{
+						keyLen: uint32(len(key)),
+						valLen: uint32(len(val)),
+					}
+					node.keywordsPageView[i] = kw
+					b := *(*[8]byte)(unsafe.Pointer(&kw))
+					buf.Write(b[:])
+					buf.Write(key)
+					buf.Write(val)
+				}
+				// 写入的长度要手动刷新, keywords所在的页不一定是起始页
+				node.pageLink[0].SetFlags(uint64(len(node.memKeywords)))
+				afterWriter = func() error {
+					return bt.writeKeywordDataToNode(tx, node, node.sumKeywordDiskOff(idx), buf.Bytes())
+				}
+				return node.pageLink[0], nil
+			} else if len(node.memKeywords) < len(node.keywordsPageView) {
+				node.keywordsPageView = node.keywordsPageView[:len(node.memKeywords)]
+				var buf bytes.Buffer
+				for i := idx; i < len(node.memKeywords); i++ {
+					key := node.memKeywords[i].key
+					val := node.memKeywords[i].val
+					kw := keywordDiskDesc{
+						keyLen: uint32(len(key)),
+						valLen: uint32(len(val)),
+					}
+					node.keywordsPageView[i] = kw
+					b := *(*[8]byte)(unsafe.Pointer(&kw))
+					buf.Write(b[:])
+					buf.Write(key)
+					buf.Write(val)
+				}
+				// 写入的长度要手动刷新, keywords所在的页不一定是起始页
+				node.pageLink[0].SetFlags(uint64(len(node.memKeywords)))
+				afterWriter = func() error {
+					return bt.writeKeywordDataToNode(tx, node, node.sumKeywordDiskOff(idx), buf.Bytes())
+				}
+				return node.pageLink[0], nil
+			} else {
+				var buf bytes.Buffer
+				for i := idx; i < len(node.memKeywords); i++ {
+					key := node.memKeywords[i].key
+					val := node.memKeywords[i].val
+					kw := keywordDiskDesc{
+						keyLen: uint32(len(key)),
+						valLen: uint32(len(val)),
+					}
+					node.keywordsPageView[i] = kw
+					b := *(*[8]byte)(unsafe.Pointer(&kw))
+					buf.Write(b[:])
+					buf.Write(key)
+					buf.Write(val)
+				}
+				afterWriter = func() error {
+					return bt.writeKeywordDataToNode(tx, node, node.sumKeywordDiskOff(idx), buf.Bytes())
+				}
+				return node.pageLink[0], nil
+			}
+		}
 	})
 	if err != nil {
 		return
 	}
-	return bt.s.writePage(tx.header, node.pageLink[0])
-}
-
-func (bt *BTreeDisk[K, V]) flushNodeKeywords(tx *Tx[K, V], node *nodeDiskDesc, idx int, onlyFlushLen bool) error {
-	// 仅刷新长度信息
-	if onlyFlushLen {
-		keywordLen := uint32(len(node.memKeywords))
-		node.pageLink[0].SetFlags(uint64(keywordLen))
-		return bt.s.writePage(tx.header, node.pageLink[0])
-	} else {
-		// 判断写入模式
-		// 3种情况, 内存中的值比磁盘中的少/跟磁盘的数量一样/比磁盘中的多, 一一处理
-		if len(node.memKeywords) > len(node.keywordsPageView) {
-			// 偏移必须在磁盘视图之内
-			if !(idx <= len(node.keywordsPageView)) {
-				return fmt.Errorf("memKeywords flush index overflow : %d", len(node.memKeywords)-1)
-			}
-			diskPageViewLen := len(node.keywordsPageView)
-			memKeywordLen := len(node.memKeywords)
-			for i := 0; i < memKeywordLen-diskPageViewLen; i++ {
-				node.keywordsPageView = append(node.keywordsPageView, keywordDiskDesc{})
-			}
-			var buf bytes.Buffer
-			for i := idx; i < len(node.memKeywords); i++ {
-				key := node.memKeywords[i].key
-				val := node.memKeywords[i].val
-				kw := keywordDiskDesc{
-					keyLen: uint32(len(key)),
-					valLen: uint32(len(val)),
-				}
-				node.keywordsPageView[i] = kw
-				b := *(*[8]byte)(unsafe.Pointer(&kw))
-				buf.Write(b[:])
-				buf.Write(key)
-				buf.Write(val)
-			}
-			// 写入的长度要手动刷新, keywords所在的页不一定是起始页
-			node.pageLink[0].SetFlags(uint64(len(node.memKeywords)))
-			err := bt.s.writePage(tx.header, node.pageLink[0])
-			if err != nil {
-				return err
-			}
-			err = bt.writeKeywordDataToNode(tx, node, node.sumKeywordDiskOff(idx), buf.Bytes())
-			if err != nil {
-				return err
-			}
-		} else if len(node.memKeywords) < len(node.keywordsPageView) {
-			node.keywordsPageView = node.keywordsPageView[:len(node.memKeywords)]
-			var buf bytes.Buffer
-			for i := idx; i < len(node.memKeywords); i++ {
-				key := node.memKeywords[i].key
-				val := node.memKeywords[i].val
-				kw := keywordDiskDesc{
-					keyLen: uint32(len(key)),
-					valLen: uint32(len(val)),
-				}
-				node.keywordsPageView[i] = kw
-				b := *(*[8]byte)(unsafe.Pointer(&kw))
-				buf.Write(b[:])
-				buf.Write(key)
-				buf.Write(val)
-			}
-			// 写入的长度要手动刷新, keywords所在的页不一定是起始页
-			node.pageLink[0].SetFlags(uint64(len(node.memKeywords)))
-			err := bt.s.writePage(tx.header, node.pageLink[0])
-			if err != nil {
-				return err
-			}
-			err = bt.writeKeywordDataToNode(tx, node, node.sumKeywordDiskOff(idx), buf.Bytes())
-			if err != nil {
-				return err
-			}
-		} else {
-			var buf bytes.Buffer
-			for i := idx; i < len(node.memKeywords); i++ {
-				key := node.memKeywords[i].key
-				val := node.memKeywords[i].val
-				kw := keywordDiskDesc{
-					keyLen: uint32(len(key)),
-					valLen: uint32(len(val)),
-				}
-				node.keywordsPageView[i] = kw
-				b := *(*[8]byte)(unsafe.Pointer(&kw))
-				buf.Write(b[:])
-				buf.Write(key)
-				buf.Write(val)
-			}
-			err := bt.writeKeywordDataToNode(tx, node, node.sumKeywordDiskOff(idx), buf.Bytes())
-			if err != nil {
-				return err
-			}
-		}
+	if afterWriter != nil {
+		err = afterWriter()
 	}
-	return nil
+	return
 }
 
 func (bt *BTreeDisk[K, V]) writeKeywordDataToNode(tx *Tx[K, V], node *nodeDiskDesc, offset uint32, buf []byte) (err error) {
@@ -671,55 +749,62 @@ func (bt *BTreeDisk[K, V]) writeKeywordDataToNode(tx *Tx[K, V], node *nodeDiskDe
 	}
 	for len(buf) > 0 {
 		maxWrite := uint32(len(targetPage.Data)) - offset
-		if maxWrite > uint32(len(buf)) {
-			maxWrite = uint32(len(buf))
-		}
-		copy(targetPage.Data[offset:offset+maxWrite], buf[:maxWrite])
-		cpDat := make([]byte, maxWrite)
-		copy(cpDat, buf[:maxWrite])
-		err = tx.addPageModify(pageRecord{
-			typ:  pageRecordStorage,
-			pgId: targetPage.Header.PgId,
-			off:  offset + targetPage.minSize(),
-			dat:  cpDat,
+		err = bt.s.modifyPage(tx.header, *targetPage, func(pd pageDesc) (pageDesc, error) {
+			if maxWrite > uint32(len(buf)) {
+				maxWrite = uint32(len(buf))
+				// 有可能影子页没写, 这里写一下
+				copy(targetPage.Data[offset:offset+maxWrite], buf[:maxWrite])
+				cpDat := make([]byte, maxWrite)
+				copy(cpDat, buf[:maxWrite])
+				err = tx.addPageModify(pageRecord{
+					typ:  pageRecordStorage,
+					pgId: targetPage.Header.PgId,
+					off:  offset + targetPage.minSize(),
+					dat:  cpDat,
+				})
+				if err != nil {
+					return pageDesc{}, err
+				}
+				err = bt.s.flushPageHeader(tx.header, targetPage)
+				if err != nil {
+					return pageDesc{}, err
+				}
+				offset = 0
+				buf = buf[maxWrite:]
+				// 写满一页了, 但还有数据
+				if len(buf) > 0 {
+					// 没有可用的页了, 分配新页
+					if targetIdx+1 >= len(node.pageLink) {
+						var (
+							res     []pageId
+							newPage pageDesc
+						)
+						res, err = bt.allocPage(tx, 1)
+						if err != nil {
+							return pageDesc{}, err
+						}
+						newPage, err = bt.s.readPage(tx.header, res[0])
+						if err != nil {
+							return pageDesc{}, err
+						}
+						node.pageLink = append(node.pageLink, newPage)
+						// 设置溢出页
+						targetPage.Header.Overflow = newPage.Header.PgId
+						// flushPageHeader会设置header的修改记录, 这里就不手动设置了
+						err = bt.s.flushPageHeader(tx.header, targetPage)
+						if err != nil {
+							return pageDesc{}, err
+						}
+						targetPage = &node.pageLink[len(node.pageLink)-1]
+					} else {
+						targetPage = &node.pageLink[targetIdx+1]
+					}
+				}
+			}
+			return *targetPage, nil
 		})
 		if err != nil {
 			return err
-		}
-		err = bt.s.writePage(tx.header, *targetPage)
-		if err != nil {
-			return err
-		}
-		offset = 0
-		buf = buf[maxWrite:]
-		// 写满一页了, 但还有数据
-		if len(buf) > 0 {
-			// 没有可用的页了, 分配新页
-			if targetIdx+1 >= len(node.pageLink) {
-				var (
-					res     []pageId
-					newPage pageDesc
-				)
-				res, err = bt.s.allocPage(tx.header, 1)
-				if err != nil {
-					return err
-				}
-				newPage, err = bt.s.readPage(tx.header, res[0])
-				if err != nil {
-					return err
-				}
-				node.pageLink = append(node.pageLink, newPage)
-				// 设置溢出页
-				targetPage.Header.Overflow = newPage.Header.PgId
-				// writePage会设置header的修改记录, 这里就不手动设置了
-				err = bt.s.writePage(tx.header, *targetPage)
-				if err != nil {
-					return
-				}
-				targetPage = &node.pageLink[len(node.pageLink)-1]
-			} else {
-				targetPage = &node.pageLink[targetIdx+1]
-			}
 		}
 	}
 	return nil
@@ -1295,4 +1380,36 @@ func (bt *BTreeDisk[K, V]) nodeGEQMin(node *nodeDiskDesc) bool {
 
 func (bt *BTreeDisk[K, V]) nodeEQMax(node *nodeDiskDesc) bool {
 	return len(node.memKeywords) >= bt.c.TreeM-1
+}
+
+// 将所有影子页刷新到内存中
+func (bt *BTreeDisk[K, V]) flushShadowPage2Disk(tx *Tx[K, V]) error {
+	err := bt.s.flushShadowPage2Disk(tx.header)
+	if err != nil {
+		errPrint(bt, "flushShadowPage2Disk.storage", err)
+		return err
+	}
+	err = bt.freelist.flushShadowPage2Disk(tx.header)
+	if err != nil {
+		errPrint(bt, "flushShadowPage2Disk.freelist", err)
+		return err
+	} else {
+		return nil
+	}
+}
+
+func (bt *BTreeDisk[K, V]) flushShadowPage(tx *Tx[K, V], writeBack bool) {
+	// 默认等待所有写完成才提交缓存
+	bt.rw.Lock()
+	defer bt.rw.Unlock()
+	bt.freelist.cache.deleteShadowPage(tx.header, writeBack)
+	bt.s.cache.deleteShadowPage(tx.header, writeBack)
+}
+
+func (bt *BTreeDisk[K, V]) createShadowPageSrc(tx *Tx[K, V]) {
+	if !tx.header.isWriteTx() {
+		panic("not write tx")
+	}
+	bt.s.cache.createShadowPage(tx.header)
+	bt.freelist.cache.createShadowPage(tx.header)
 }

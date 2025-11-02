@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"os"
+	"sync"
 )
 
 const (
@@ -53,8 +54,6 @@ type txHeader struct {
 	records                 []pageRecord
 	storagePageChangeRecord map[uint64][]pageRecord
 	freePageChangeRecord    map[uint64][]pageRecord
-	// page cache中的页是旧版本, 这些影子页在事务提交完成前只在当前事务可见
-	shadowPage map[shadowPageKey]cachePage
 }
 
 func newTxHeader() *txHeader {
@@ -62,7 +61,6 @@ func newTxHeader() *txHeader {
 		records:                 make([]pageRecord, 0, 64),
 		storagePageChangeRecord: make(map[uint64][]pageRecord, 16),
 		freePageChangeRecord:    make(map[uint64][]pageRecord, 16),
-		shadowPage:              make(map[shadowPageKey]cachePage, 16),
 	}
 }
 
@@ -109,37 +107,28 @@ func (h *txHeader) addPageModify(r pageRecord) error {
 	return nil
 }
 
-func (h *txHeader) getPage(src int, pageId uint64) (p cachePage, found bool) {
-	p, found = h.shadowPage[shadowPageKey{
-		typ:    src,
-		pageId: pageId,
-	}]
-	return
-}
-
-func (h *txHeader) updatePage(src int, pgId uint64, p cachePage) {
-	key := shadowPageKey{
-		typ:    src,
-		pageId: pgId,
+func (h *txHeader) getChangeList(typ uint8) []uint64 {
+	var changeRecord map[uint64][]pageRecord
+	switch typ {
+	case pageRecordStorage:
+		changeRecord = h.storagePageChangeRecord
+	case pageRecordFree:
+		changeRecord = h.freePageChangeRecord
+	default:
+		panic("invalid page type")
 	}
-	// 影子页不能和原页使用同一块内存, 否则同一块内存会被读者和写者同时操作
-	v, ok := h.shadowPage[key]
-	if ok {
-		v.txSeq = p.txSeq
-		v.pgId = p.pgId
-		copy(v.data, p.data)
-	} else {
-		oldData := p.data
-		p.data = make([]byte, len(oldData))
-		copy(p.data, oldData)
-		h.shadowPage[key] = p
+	changeList := make([]uint64, 0, len(changeRecord))
+	for pgId := range changeRecord {
+		changeList = append(changeList, pgId)
 	}
+	return changeList
 }
 
 type Tx[K any, V any] struct {
 	header    *txHeader
 	tree      *BTreeDisk[K, V]
 	recordLog *os.File
+	pool      sync.Pool
 }
 
 func newTx[K any, V any](bt *BTreeDisk[K, V]) *Tx[K, V] {
@@ -147,6 +136,11 @@ func newTx[K any, V any](bt *BTreeDisk[K, V]) *Tx[K, V] {
 		header:    newTxHeader(),
 		tree:      bt,
 		recordLog: bt.recordLogFile,
+		pool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, recordSize)
+			},
+		},
 	}
 }
 
@@ -159,6 +153,7 @@ func (tx *Tx[K, V]) begin() error {
 		tx.header.records = make([]pageRecord, 0, 4)
 		tx.header.storagePageChangeRecord = make(map[uint64][]pageRecord, 8)
 		tx.header.freePageChangeRecord = make(map[uint64][]pageRecord, 8)
+		tx.tree.createShadowPageSrc(tx)
 		return nil
 	}
 }
@@ -172,45 +167,9 @@ func (tx *Tx[K, V]) Rollback() error {
 	}
 	tx.header.records = nil
 	tx.header.isRollback = true
+	tx.tree.flushShadowPage(tx, false)
 	defer tx.tree.txMu.Unlock()
 	return tx.recordLog.Truncate(0)
-}
-
-func (tx *Tx[K, V]) flushAllShadowPage(isRecovery bool) {
-	// 故障恢复期间本身就是独占的, 不需要申请锁
-	if !isRecovery {
-		// 申请独占写, 保证更新期间没有读者, 否则读者可能看到不一致的BTree
-		tx.tree.rw.Lock()
-		defer tx.tree.rw.Unlock()
-	}
-	var (
-		freelistShadowPageList = make([]batchPutItem, 0, 16)
-		storageShadowPageList  = make([]batchPutItem, 0, 16)
-	)
-	for key, val := range tx.header.shadowPage {
-		switch key.typ {
-		case freelistShadowPage:
-			freelistShadowPageList = append(freelistShadowPageList, batchPutItem{
-				pgId: key.pageId,
-				val:  val,
-			})
-		case storageShadowPage:
-			storageShadowPageList = append(storageShadowPageList, batchPutItem{
-				pgId: key.pageId,
-				val:  val,
-			})
-		default:
-			panic(fmt.Sprintf("invalid shadow page type : %d", key.typ))
-		}
-	}
-	tx.tree.s.cache.batchPutPage(storageShadowPageList, true)
-	err := tx.tree.s.opFreelist(func(v *freelist2) error {
-		v.cache.batchPutPage(freelistShadowPageList, true)
-		return nil
-	})
-	if err != nil {
-		panic(err)
-	}
 }
 
 func (tx *Tx[K, V]) checkAbleUse() error {

@@ -27,6 +27,7 @@ func TestFreelist(t *testing.T) {
 		storagePageChangeRecord: make(map[uint64][]pageRecord),
 		freePageChangeRecord:    make(map[uint64][]pageRecord),
 	}
+	f.cache.createShadowPage(txh)
 	require.NoError(t, f.build(txh, pgIdList))
 	var nextPgId uint64 = 3
 	for {

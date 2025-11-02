@@ -32,43 +32,51 @@ func (p *freelist2Pos) getOfU8() uint64 {
 }
 
 func (p *freelist2Pos) set(txh *txHeader, v pageId) error {
-	copy(p.buf[p.innerIdx*uint64(pgIdMemSize):], v[:])
-	err := txh.addPageModify(pageRecord{
-		typ:  pageRecordFree,
-		pgId: createPageIdFromUint64(p.pgId),
-		off:  uint32(p.innerIdx) * uint32(pgIdMemSize),
-		dat:  v[:],
+	return p.f.modifyPage(txh, p.pgId, p.buf, func(b []byte) ([]byte, error) {
+		copy(b[p.innerIdx*uint64(pgIdMemSize):], v[:])
+		err := txh.addPageModify(pageRecord{
+			typ:  pageRecordFree,
+			pgId: createPageIdFromUint64(p.pgId),
+			off:  uint32(p.innerIdx) * uint32(pgIdMemSize),
+			dat:  v[:],
+		})
+		if err != nil {
+			return b, err
+		} else {
+			return b, nil
+		}
 	})
-	if err != nil {
-		return err
-	}
-	return p.f.writePage(txh, p.pgId, p.buf)
 }
 
 func (p *freelist2Pos) setWithIdx(txh *txHeader, innerIdx uint64, v pageId) error {
-	copy(p.buf[innerIdx*uint64(pgIdMemSize):], v[:])
-	err := txh.addPageModify(pageRecord{
-		typ:  pageRecordFree,
-		pgId: createPageIdFromUint64(p.pgId),
-		off:  uint32(innerIdx) * uint32(pgIdMemSize),
-		dat:  v[:],
+	return p.f.modifyPage(txh, p.pgId, p.buf, func(b []byte) ([]byte, error) {
+		copy(b[innerIdx*uint64(pgIdMemSize):], v[:])
+		err := txh.addPageModify(pageRecord{
+			typ:  pageRecordFree,
+			pgId: createPageIdFromUint64(p.pgId),
+			off:  uint32(innerIdx) * uint32(pgIdMemSize),
+			dat:  v[:],
+		})
+		if err != nil {
+			return b, err
+		} else {
+			return b, nil
+		}
 	})
-	if err != nil {
-		return err
-	}
-	return p.f.writePage(txh, p.pgId, p.buf)
 }
 
 type freelist2 struct {
-	file  *os.File
-	opt   *pageStorageOption
-	cache pageCacheI
+	file   *os.File
+	opt    *pageStorageOption
+	cache  pageCacheI
+	cipher Cipher
 }
 
 func newFreelist2(opt *pageStorageOption) *freelist2 {
 	return &freelist2{
-		opt:   opt,
-		cache: newLFUCache(opt.FreelistMaxCacheSize),
+		opt:    opt,
+		cache:  newLFUCache(opt.FreelistMaxCacheSize),
+		cipher: opt.PageCipher,
 	}
 }
 
@@ -101,7 +109,20 @@ func (f *freelist2) close() (err error) {
 }
 
 func (f *freelist2) initFile() (err error) {
-	return f.file.Truncate(int64(recordSize))
+	err = f.file.Truncate(int64(recordSize))
+	if err != nil {
+		f.opt.Logger.Error("freelist2 truncate fail", "err", err)
+		return
+	}
+	pgIdList := make([]pageId, 0, defaultPageCount)
+	for i := 3; i < defaultPageCount; i++ {
+		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
+	}
+	err = f.build(nil, pgIdList)
+	if err != nil {
+		f.opt.Logger.Error("freelist2 build fail", "err", err)
+	}
+	return
 }
 
 func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err error) {
@@ -109,39 +130,22 @@ func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err erro
 		buf, err = f.readRawPage(pageId)
 		return
 	}
-	if txh.isWriteTx() {
-		cp, found := txh.getPage(freelistShadowPage, pageId)
-		if found {
-			return cp.data, nil
-		}
-		cp, found = f.cache.getAndLockPage(pageId)
-		if found {
-			return cp.data, nil
-		}
-		buf, err = f.readRawPage(pageId)
-		if err != nil {
-			return
-		}
-		f.cache.putAndLockPage(pageId, cachePage{
-			txSeq: txh.seq,
-			data:  buf,
-			pgId:  createPageIdFromUint64(pageId),
-		})
-	} else {
-		cp, found := f.cache.getPage(pageId)
-		if found {
-			return cp.data, nil
-		}
-		buf, err = f.readRawPage(pageId)
-		if err != nil {
-			return
-		}
-		f.cache.putPage(pageId, cachePage{
-			txSeq: txh.seq,
-			data:  buf,
-			pgId:  createPageIdFromUint64(pageId),
-		})
+	if !txh.isWriteTx() {
+		panic("not write tx")
 	}
+	cp, found := f.cache.getPage(txh, pageId)
+	if found {
+		return cp.data, nil
+	}
+	buf, err = f.readRawPage(pageId)
+	if err != nil {
+		return
+	}
+	f.cache.putPage(txh, pageId, cachePage{
+		txSeq: txh.seq,
+		data:  buf,
+		pgId:  createPageIdFromUint64(pageId),
+	})
 	return
 }
 
@@ -157,20 +161,6 @@ func (f *freelist2) readRawPage(pageId uint64) ([]byte, error) {
 	} else {
 		return buf, nil
 	}
-}
-
-func (f *freelist2) writePage(txh *txHeader, pageId uint64, buf []byte) error {
-	if !txh.valid() {
-		return f.writeRawPage(pageId, buf)
-	}
-	if txh.isWriteTx() {
-		txh.updatePage(freelistShadowPage, pageId, cachePage{
-			txSeq: txh.seq,
-			data:  buf,
-			pgId:  createPageIdFromUint64(pageId),
-		})
-	}
-	return nil
 }
 
 func (f *freelist2) writeRawPage(pageId uint64, buf []byte) error {
@@ -229,6 +219,32 @@ func (f *freelist2) isFull(length uint64) (bool, error) {
 	}
 }
 
+func (f *freelist2) modifyPage(txh *txHeader, pageId uint64, buf []byte, fn func(b []byte) ([]byte, error)) (err error) {
+	if !txh.valid() {
+		buf, err = fn(buf)
+		if err != nil {
+			return
+		}
+		return f.writeRawPage(pageId, buf)
+	}
+	if !txh.isWriteTx() {
+		panic("not write tx")
+	}
+	f.cache.opShadowPage(txh, cachePage{
+		txSeq: txh.seq,
+		data:  buf,
+		pgId:  createPageIdFromUint64(pageId),
+	}, func(p cachePage) (cachePage, bool) {
+		p.data, err = fn(p.data)
+		if err != nil {
+			return cachePage{}, false
+		} else {
+			return p, true
+		}
+	})
+	return
+}
+
 func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 	isSorted := slices.IsSortedFunc(pgIdList, func(a, b pageId) int {
 		return cmp.Compare(a.ToUint64(), b.ToUint64())
@@ -265,32 +281,34 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 		if int(maxWrite) > len(pgIdList) {
 			maxWrite = uint32(len(pgIdList))
 		}
-		if idx == 0 {
-			writeLen := createPageIdFromUint64(uint64(len(pgIdList)))
-			copy(buf[:pgIdMemSize], writeLen[:])
-			for i := 0; i < int(maxWrite); i++ {
-				copy(buf[uintptr(i+1)*pgIdMemSize:], pgIdList[i][:])
+		err = f.modifyPage(txh, uint64(idx), buf, func(buf2 []byte) ([]byte, error) {
+			if idx == 0 {
+				writeLen := createPageIdFromUint64(uint64(len(pgIdList)))
+				copy(buf2[:pgIdMemSize], writeLen[:])
+				for i := 0; i < int(maxWrite); i++ {
+					copy(buf2[uintptr(i+1)*pgIdMemSize:], pgIdList[i][:])
+				}
+			} else {
+				for i := 0; i < int(maxWrite); i++ {
+					copy(buf2[uintptr(i)*pgIdMemSize:], pgIdList[i][:])
+				}
 			}
-		} else {
-			for i := 0; i < int(maxWrite); i++ {
-				copy(buf[uintptr(i)*pgIdMemSize:], pgIdList[i][:])
+			// 非初始化时写入页修改记录
+			if txh.valid() {
+				err = txh.addPageModify(pageRecord{
+					typ:  pageRecordFree,
+					pgId: createPageIdFromUint64(uint64(idx)),
+					off:  0,
+					dat:  buf2,
+				})
+				if err != nil {
+					return buf2, err
+				}
 			}
-		}
-		err = f.writePage(txh, uint64(idx), buf)
+			return buf2, nil
+		})
 		if err != nil {
-			return err
-		}
-		// 非初始化时写入页修改记录
-		if txh.valid() {
-			err = txh.addPageModify(pageRecord{
-				typ:  pageRecordFree,
-				pgId: createPageIdFromUint64(uint64(idx)),
-				off:  0,
-				dat:  buf,
-			})
-			if err != nil {
-				return err
-			}
+			return
 		}
 		pgIdList = pgIdList[maxWrite:]
 		idx++
@@ -483,6 +501,24 @@ func (f *freelist2) down(txh *txHeader, endIdx uint64) error {
 			break
 		}
 		idx = cmpIdx
+	}
+	return nil
+}
+
+func (f *freelist2) flushShadowPage2Disk(txh *txHeader) error {
+	changeList := txh.getChangeList(pageRecordFree)
+	if len(changeList) == 0 {
+		return nil
+	}
+	for _, pgId := range changeList {
+		p, ok := f.cache.getShadowPageChange(txh, pgId)
+		if !ok {
+			return fmt.Errorf("tx have page change, but no shadow page : %d", pgId)
+		}
+		err := f.writeRawPage(pgId, p.data)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
