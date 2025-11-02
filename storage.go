@@ -307,6 +307,7 @@ func (m *pageStorage) close() (err error) {
 		return
 	}
 	m.file = nil
+	m.cache = nil
 	return
 }
 
@@ -484,7 +485,7 @@ func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if readCount != int(readCount) {
+	if readCount != int(recordSize) {
 		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, readCount)
 	}
 	if m.cipher != nil && !bytesIsZero(buf) {

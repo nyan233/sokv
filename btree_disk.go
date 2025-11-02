@@ -120,6 +120,7 @@ type BTreeDisk[K any, V any] struct {
 	// 用于保证事务提交时操作pageCache时不会和读者产生冲突
 	rw            sync.RWMutex
 	txMu          sync.Mutex
+	closed        atomic.Bool
 	keyCodec      Codec[K]
 	valCodec      Codec[V]
 	size          atomic.Uint64
@@ -246,6 +247,40 @@ func (bt *BTreeDisk[K, V]) Init() error {
 			return err
 		}
 		return bt.crashRecovery(recordLogFile)
+	}
+	return nil
+}
+
+func (bt *BTreeDisk[K, V]) Close() error {
+	bt.closed.Store(true)
+	foundWriteTx := !bt.txMu.TryLock()
+	// 关闭时有正在执行的写事务, 等待执行完成
+	if foundWriteTx {
+		for !bt.txMu.TryLock() {
+		}
+		bt.txMu.Unlock()
+	}
+	// 关闭时有正在执行的读事务, 等待执行完成
+	foundReadTx := !bt.rw.TryLock()
+	if foundReadTx {
+		for !bt.rw.TryLock() {
+		}
+		bt.rw.Unlock()
+	}
+	err := bt.recordLogFile.Close()
+	if err != nil {
+		errPrint(bt, "close.recordLogFile", err)
+		return err
+	}
+	err = bt.s.close()
+	if err != nil {
+		errPrint(bt, "close.storage", err)
+		return err
+	}
+	err = bt.freelist.close()
+	if err != nil {
+		errPrint(bt, "close.freelist", err)
+		return err
 	}
 	return nil
 }
@@ -397,6 +432,9 @@ func (bt *BTreeDisk[K, V]) doWritePageData(tx *Tx[K, V], isRecovery bool) error 
 }
 
 func (bt *BTreeDisk[K, V]) BeginTx(logic func(tx *Tx[K, V]) error, option *TxOption) error {
+	if bt.closed.Load() {
+		return fmt.Errorf("tree is closed")
+	}
 	tx := newTx(bt)
 	if option.IsWriteTx {
 		tx.header.isRead = false

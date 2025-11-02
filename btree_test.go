@@ -174,3 +174,70 @@ func TestBTree(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+func TestReOpenBtree(t *testing.T) {
+	initTest(t)
+	si := func() *BTreeDisk[uint64, string] {
+		bt := NewBTreeDisk[uint64, string](Config{
+			RootDir:                  "testdata",
+			Name:                     "testbt.reopen",
+			TreeM:                    64,
+			MaxPageCacheSize:         1024 * 1024,
+			MaxFreeListPageCacheSize: 1024 * 1024,
+			//CipherFactory: func() (Cipher, error) {
+			//	const AesKeyHex = "112233445566778899aabbccddeeff11"
+			//	key := make([]byte, hex.DecodedLen(len(AesKeyHex)))
+			//	_, err := hex.Decode(key, []byte(AesKeyHex))
+			//	if err != nil {
+			//		return nil, err
+			//	}
+			//	return NewAseCipher(key)
+			//},
+		})
+		bt.SetKeyCodec(new(Uint64Codec))
+		bt.SetValCodec(new(JsonTypeCodec[string]))
+		require.NoError(t, bt.Init())
+		return bt
+	}
+	bt := si()
+	err := bt.BeginWriteTx(func(tx *Tx[uint64, string]) (err error) {
+		for i := 0; i < 1024; i++ {
+			_, err = tx.Put(uint64(i), "hello world")
+			require.NoError(t, err)
+		}
+		v, found, err := tx.Get(1023)
+		require.NoError(t, err)
+		v, found, err = tx.Get(512)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, "hello world", v)
+		_, err = tx.Put(1024, "hello world")
+		require.NoError(t, err)
+		v, found, err = tx.Del(1022)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, "hello world", v)
+		v, found, err = tx.Get(1022)
+		require.NoError(t, err)
+		require.False(t, found)
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, bt.Close())
+	err = bt.BeginOnlyReadTx(func(tx *Tx[uint64, string]) (err error) {
+		return nil
+	})
+	require.Error(t, err)
+	require.Equal(t, err.Error(), "tree is closed")
+	bt = si()
+	err = bt.BeginOnlyReadTx(func(tx *Tx[uint64, string]) (err error) {
+		for i := 0; i < 1000; i++ {
+			v, found, err := tx.Get(uint64(i))
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, "hello world", v)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+}
