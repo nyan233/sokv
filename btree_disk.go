@@ -23,6 +23,169 @@ const (
 	treeMaxM = 256
 )
 
+type Cursor[K any, V any] interface {
+	Min() K
+	Max() K
+	Prev() (bool, error)
+	Next() (bool, error)
+	Seek(key K, isStart bool) error
+	Key() K
+	Value() V
+}
+
+type nodePos struct {
+	id  pageId
+	idx int
+}
+
+type cursor[K, V any] struct {
+	path      []nodePos
+	cacheNode *nodeDiskDesc
+	minKey    K
+	maxKey    K
+	curPos    nodePos
+}
+
+func (c *cursor[K, V]) Min() K {
+	return c.minKey
+}
+
+func (c *cursor[K, V]) Max() K {
+	return c.maxKey
+}
+
+func (c *cursor[K, V]) Prev() (bool, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *cursor[K, V]) Next() (bool, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *cursor[K, V]) Seek(key K, isStart bool) error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *cursor[K, V]) Key() K {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c *cursor[K, V]) Value() V {
+	//TODO implement me
+	panic("implement me")
+}
+
+type Iterator[K any, V any] interface {
+	Prev() (bool, error)
+	Next() (bool, error)
+	Key() (K, error)
+	Value() (V, error)
+	Valid() bool
+	ResetPos(start bool)
+}
+
+type iterNode struct {
+	parent     *iterNode
+	id         pageId
+	node       *nodeDiskDesc
+	iParentIdx int
+}
+
+type iterPos struct {
+	n   *iterNode
+	idx int
+}
+
+func (p *iterPos) isEnd() bool {
+	return p.idx >= len(p.n.node.memKeywords)
+}
+
+func (p *iterPos) isStart() bool {
+	return p.idx == 0
+}
+
+func (p *iterPos) Key() []byte {
+	return p.n.node.memKeywords[p.idx].key
+}
+
+func (p *iterPos) Value() []byte {
+	return p.n.node.memKeywords[p.idx].val
+}
+
+type iteratorImpl[K any, V any] struct {
+	t     *BTreeDisk[K, V]
+	tx    *Tx[K, V]
+	valid bool
+	start []byte
+	end   []byte
+	root  *nodeDiskDesc
+	// pageId -> iterNode
+	nodeMap map[uint64]*iterNode
+	curPos  iterPos
+}
+
+func (it *iteratorImpl[K, V]) Valid() bool {
+	return it.valid
+}
+
+func (it *iteratorImpl[K, V]) Prev() (bool, error) {
+	if !it.Valid() {
+		return false, nil
+	}
+	if !it.curPos.isStart() {
+		it.curPos.idx--
+		return true, nil
+	}
+	return false, nil
+}
+
+func (it *iteratorImpl[K, V]) Next() (bool, error) {
+	if !it.Valid() {
+		return false, nil
+	}
+	if !it.curPos.isEnd() {
+		it.curPos.idx++
+		return true, nil
+	}
+}
+
+func (it *iteratorImpl[K, V]) Key() (key K, err error) {
+	if !it.Valid() {
+		err = ErrorKeyNotFound
+		return
+	}
+	curPos := it.curPos
+	if curPos.n == nil {
+		err = ErrorKeyNotFound
+		return
+	}
+	err = it.t.keyCodec.Unmarshal(curPos.Key(), &key)
+	return
+}
+
+func (it *iteratorImpl[K, V]) Value() (val V, err error) {
+	if !it.Valid() {
+		err = ErrorKeyNotFound
+		return
+	}
+	curPos := it.curPos
+	if curPos.n == nil {
+		err = ErrorKeyNotFound
+		return
+	}
+	err = it.t.valCodec.Unmarshal(curPos.Value(), &val)
+	return
+}
+
+func (it *iteratorImpl[K, V]) ResetPos(start bool) {
+	//TODO implement me
+	panic("implement me")
+}
+
 type stackElement struct {
 	node *nodeDiskDesc
 	tag  uint64
@@ -428,9 +591,9 @@ func (bt *BTreeDisk[K, V]) doWritePageData(tx *Tx[K, V], isRecovery bool) error 
 	return nil
 }
 
-func (bt *BTreeDisk[K, V]) BeginTx(logic func(tx *Tx[K, V]) error, option *TxOption) error {
+func (bt *BTreeDisk[K, V]) createTx(option *TxOption) (*Tx[K, V], error) {
 	if bt.closed.Load() {
-		return fmt.Errorf("tree is closed")
+		return nil, fmt.Errorf("tree is closed")
 	}
 	tx := newTx(bt)
 	if option.IsWriteTx {
@@ -440,8 +603,13 @@ func (bt *BTreeDisk[K, V]) BeginTx(logic func(tx *Tx[K, V]) error, option *TxOpt
 		tx.header.isRead = true
 		tx.header.seq = bt.txSeq.Load()
 	}
-	err := tx.begin()
+	return tx, tx.begin()
+}
+
+func (bt *BTreeDisk[K, V]) BeginTx(logic func(tx *Tx[K, V]) error, option *TxOption) error {
+	tx, err := bt.createTx(option)
 	if err != nil {
+		errPrint(bt, "bt.BeginTx.createTx", err)
 		return err
 	}
 	err = bt.doLogic(tx, logic)
@@ -479,6 +647,10 @@ func (bt *BTreeDisk[K, V]) doLogic(tx *Tx[K, V], logic func(tx *Tx[K, V]) error)
 		}
 	}()
 	return logic(tx)
+}
+
+func (bt *BTreeDisk[K, V]) CreateTx(opt *TxOption) (*Tx[K, V], error) {
+	return bt.createTx(opt)
 }
 
 func (bt *BTreeDisk[K, V]) loadRootNode(tx *Tx[K, V]) (d *nodeDiskDesc, err error) {
@@ -1457,4 +1629,28 @@ func (bt *BTreeDisk[K, V]) createShadowPageSrc(tx *Tx[K, V]) {
 	}
 	bt.s.cache.createShadowPage(tx.header)
 	bt.freelist.cache.createShadowPage(tx.header)
+}
+
+func (bt *BTreeDisk[K, V]) CreateIterator(tx *Tx[K, V], start, end []byte) (Iterator[K, V], error) {
+	it := &iteratorImpl[K, V]{
+		t:     bt,
+		tx:    tx,
+		start: start,
+		end:   end,
+		s:     new(stack),
+	}
+	var err error
+	root, err := bt.loadRootNode(tx)
+	if err != nil {
+		return nil, err
+	}
+	if len(root.memKeywords) == 0 {
+		it.valid = false
+		return it, nil
+	}
+	it.root, it.idx, err = bt.findNode(tx, root, it.s, start)
+	if err != nil {
+		return nil, err
+	}
+	return it, nil
 }

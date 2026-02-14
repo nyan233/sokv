@@ -23,7 +23,7 @@ func BenchmarkBTreeDisk(b *testing.B) {
 			bt := NewBTreeDisk[uint64, string](Config{
 				RootDir:                  "testdata",
 				Name:                     "testbt.reopen",
-				TreeM:                    64,
+				TreeM:                    128,
 				MaxPageCacheSize:         1024 * 1024,
 				MaxFreeListPageCacheSize: 1024 * 1024,
 				//CipherFactory: func() (Cipher, error) {

@@ -5,4 +5,5 @@ import "errors"
 var (
 	errPageIdOverflow  = errors.New("page id overflow")
 	errNoAvailablePage = errors.New("no available page")
+	ErrorKeyNotFound   = errors.New("key not found")
 )

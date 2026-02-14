@@ -182,6 +182,15 @@ func (tx *Tx[K, V]) checkAbleUse() error {
 	}
 }
 
+// Close 关闭事务, 读事务释放读锁, 写事务则回滚变更
+func (tx *Tx[K, V]) Close() error {
+	if !tx.header.isWriteTx() {
+		return tx.commit()
+	} else {
+		return tx.Rollback()
+	}
+}
+
 func (tx *Tx[K, V]) commit() error {
 	if err := tx.checkAbleUse(); err != nil {
 		return err
