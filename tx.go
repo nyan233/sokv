@@ -26,7 +26,7 @@ type pageRecordHeader struct {
 
 type pageRecord struct {
 	typ   uint8
-	pgId  pageId
+	pgId  uint32
 	txSeq uint64
 	off   uint32
 	dat   []byte
@@ -52,15 +52,15 @@ type txHeader struct {
 	isRollback              bool
 	isCommit                bool
 	records                 []pageRecord
-	storagePageChangeRecord map[uint64][]pageRecord
-	freePageChangeRecord    map[uint64][]pageRecord
+	storagePageChangeRecord map[uint32][]pageRecord
+	freePageChangeRecord    map[uint32][]pageRecord
 }
 
 func newTxHeader() *txHeader {
 	return &txHeader{
 		records:                 make([]pageRecord, 0, 64),
-		storagePageChangeRecord: make(map[uint64][]pageRecord, 16),
-		freePageChangeRecord:    make(map[uint64][]pageRecord, 16),
+		storagePageChangeRecord: make(map[uint32][]pageRecord, 16),
+		freePageChangeRecord:    make(map[uint32][]pageRecord, 16),
 	}
 }
 
@@ -89,7 +89,7 @@ func (h *txHeader) addPageModify(r pageRecord) error {
 	r.txSeq = h.seq
 	var (
 		change = h.storagePageChangeRecord
-		pgId   = r.pgId.ToUint64()
+		pgId   = r.pgId
 	)
 	if r.typ == pageRecordFree {
 		change = h.freePageChangeRecord
@@ -107,8 +107,8 @@ func (h *txHeader) addPageModify(r pageRecord) error {
 	return nil
 }
 
-func (h *txHeader) getChangeList(typ uint8) []uint64 {
-	var changeRecord map[uint64][]pageRecord
+func (h *txHeader) getChangeList(typ uint8) []uint32 {
+	var changeRecord map[uint32][]pageRecord
 	switch typ {
 	case pageRecordStorage:
 		changeRecord = h.storagePageChangeRecord
@@ -117,7 +117,7 @@ func (h *txHeader) getChangeList(typ uint8) []uint64 {
 	default:
 		panic("invalid page type")
 	}
-	changeList := make([]uint64, 0, len(changeRecord))
+	changeList := make([]uint32, 0, len(changeRecord))
 	for pgId := range changeRecord {
 		changeList = append(changeList, pgId)
 	}
@@ -151,8 +151,8 @@ func (tx *Tx[K, V]) begin() error {
 	} else {
 		tx.tree.txMu.Lock()
 		tx.header.records = make([]pageRecord, 0, 4)
-		tx.header.storagePageChangeRecord = make(map[uint64][]pageRecord, 8)
-		tx.header.freePageChangeRecord = make(map[uint64][]pageRecord, 8)
+		tx.header.storagePageChangeRecord = make(map[uint32][]pageRecord, 8)
+		tx.header.freePageChangeRecord = make(map[uint32][]pageRecord, 8)
 		tx.tree.createShadowPageSrc(tx)
 		return nil
 	}

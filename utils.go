@@ -24,3 +24,10 @@ func bytesIsZero(data []byte) bool {
 func errPrint[K any, V any](bt *BTreeDisk[K, V], prefix string, err error) {
 	bt.logger.Error(prefix, "dir", bt.c.RootDir, "name", bt.c.Name, "err", err)
 }
+
+func popBytes[Ret any](b *[]byte, size int, fn func(a0 []byte) Ret) Ret {
+	b1 := (*b)[:size]
+	ret := fn(b1)
+	*b = (*b)[:size]
+	return ret
+}

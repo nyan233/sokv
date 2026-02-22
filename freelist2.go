@@ -2,6 +2,7 @@ package sokv
 
 import (
 	"cmp"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/nyan233/sokv/internal/sys"
@@ -12,33 +13,24 @@ import (
 type freelist2Pos struct {
 	f         *freelist2
 	buf       []byte
-	globalIdx uint64
-	innerIdx  uint64
-	pgId      uint64
+	globalIdx uint32
+	innerIdx  uint32
+	pgId      uint32
 }
 
-func (p *freelist2Pos) get() pageId {
-	return pageId(p.buf[p.innerIdx*uint64(pgIdMemSize) : (p.innerIdx+1)*uint64(pgIdMemSize)])
+func (p *freelist2Pos) get() uint32 {
+	return binary.BigEndian.Uint32(p.buf[p.innerIdx*uint32(pgIdMemSize) : (p.innerIdx+1)*uint32(pgIdMemSize)])
 }
 
-func (p *freelist2Pos) getOfBytes() []byte {
-	pgId := p.get()
-	return pgId[:]
-}
-
-func (p *freelist2Pos) getOfU8() uint64 {
-	pgId := p.get()
-	return pgId.ToUint64()
-}
-
-func (p *freelist2Pos) set(txh *txHeader, v pageId) error {
+func (p *freelist2Pos) set(txh *txHeader, v uint32) error {
 	return p.f.modifyPage(txh, p.pgId, p.buf, func(b []byte) ([]byte, error) {
-		copy(b[p.innerIdx*uint64(pgIdMemSize):], v[:])
+		s := p.innerIdx * uint32(pgIdMemSize)
+		binary.BigEndian.PutUint32(b[s:], v)
 		err := txh.addPageModify(pageRecord{
 			typ:  pageRecordFree,
-			pgId: createPageIdFromUint64(p.pgId),
-			off:  uint32(p.innerIdx) * uint32(pgIdMemSize),
-			dat:  v[:],
+			pgId: p.pgId,
+			off:  p.innerIdx * uint32(pgIdMemSize),
+			dat:  b[s : s+4],
 		})
 		if err != nil {
 			return b, err
@@ -48,14 +40,15 @@ func (p *freelist2Pos) set(txh *txHeader, v pageId) error {
 	})
 }
 
-func (p *freelist2Pos) setWithIdx(txh *txHeader, innerIdx uint64, v pageId) error {
+func (p *freelist2Pos) setWithIdx(txh *txHeader, innerIdx uint64, v uint32) error {
 	return p.f.modifyPage(txh, p.pgId, p.buf, func(b []byte) ([]byte, error) {
-		copy(b[innerIdx*uint64(pgIdMemSize):], v[:])
+		s := innerIdx * uint64(pgIdMemSize)
+		binary.BigEndian.PutUint32(b[s:], v)
 		err := txh.addPageModify(pageRecord{
 			typ:  pageRecordFree,
-			pgId: createPageIdFromUint64(p.pgId),
+			pgId: p.pgId,
 			off:  uint32(innerIdx) * uint32(pgIdMemSize),
-			dat:  v[:],
+			dat:  b[s : s+4],
 		})
 		if err != nil {
 			return b, err
@@ -114,9 +107,9 @@ func (f *freelist2) initFile() (err error) {
 		f.opt.Logger.Error("freelist2 truncate fail", "err", err)
 		return
 	}
-	pgIdList := make([]pageId, 0, defaultPageCount)
+	pgIdList := make([]uint32, 0, defaultPageCount)
 	for i := 3; i < defaultPageCount; i++ {
-		pgIdList = append(pgIdList, createPageIdFromUint64(uint64(i)))
+		pgIdList = append(pgIdList, uint32(i))
 	}
 	err = f.build(nil, pgIdList)
 	if err != nil {
@@ -125,7 +118,7 @@ func (f *freelist2) initFile() (err error) {
 	return
 }
 
-func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err error) {
+func (f *freelist2) readPage(txh *txHeader, pageId uint32) (buf []byte, err error) {
 	if !txh.valid() {
 		buf, err = f.readRawPage(pageId)
 		return
@@ -144,12 +137,12 @@ func (f *freelist2) readPage(txh *txHeader, pageId uint64) (buf []byte, err erro
 	f.cache.putPage(txh, pageId, cachePage{
 		txSeq: txh.seq,
 		data:  buf,
-		pgId:  createPageIdFromUint64(pageId),
+		pgId:  pageId,
 	})
 	return
 }
 
-func (f *freelist2) readRawPage(pageId uint64) ([]byte, error) {
+func (f *freelist2) readRawPage(pageId uint32) ([]byte, error) {
 	buf := make([]byte, recordSize)
 	readCount, err := f.file.ReadAt(buf, int64(pageId)*int64(recordSize))
 	if err != nil {
@@ -163,7 +156,7 @@ func (f *freelist2) readRawPage(pageId uint64) ([]byte, error) {
 	}
 }
 
-func (f *freelist2) writeRawPage(pageId uint64, buf []byte) error {
+func (f *freelist2) writeRawPage(pageId uint32, buf []byte) error {
 	writeCount, err := f.file.WriteAt(buf, int64(pageId)*int64(recordSize))
 	if err != nil {
 		return err
@@ -174,7 +167,7 @@ func (f *freelist2) writeRawPage(pageId uint64, buf []byte) error {
 	return nil
 }
 
-func (f *freelist2) position(txh *txHeader, globalIdx uint64) (*freelist2Pos, error) {
+func (f *freelist2) position(txh *txHeader, globalIdx uint32) (*freelist2Pos, error) {
 	var (
 		pos = new(freelist2Pos)
 		err error
@@ -182,7 +175,7 @@ func (f *freelist2) position(txh *txHeader, globalIdx uint64) (*freelist2Pos, er
 	pos.f = f
 	pos.globalIdx = globalIdx
 	// 第一个页的第一个值是用来存储length的, 并不是真实的值
-	pageIdCount := uint64(recordSize) / uint64(pgIdMemSize)
+	pageIdCount := uint32(recordSize) / uint32(pgIdMemSize)
 	pos.pgId = globalIdx / pageIdCount
 	pos.innerIdx = globalIdx % pageIdCount
 	pos.buf, err = f.readPage(txh, pos.pgId)
@@ -205,21 +198,21 @@ func (f *freelist2) growFile() (err error) {
 	return f.file.Truncate(fileSize)
 }
 
-func (f *freelist2) isFull(length uint64) (bool, error) {
-	pageIdCount := uint64(recordSize / uint32(pgIdMemSize))
+func (f *freelist2) isFull(length uint32) (bool, error) {
+	pageIdCount := recordSize / uint32(pgIdMemSize)
 	requirePage := length / pageIdCount
 	stat, err := f.file.Stat()
 	if err != nil {
 		return false, err
 	}
-	if int64(requirePage*uint64(recordSize)) > stat.Size() {
+	if int64(requirePage*recordSize) > stat.Size() {
 		return true, nil
 	} else {
 		return false, nil
 	}
 }
 
-func (f *freelist2) modifyPage(txh *txHeader, pageId uint64, buf []byte, fn func(b []byte) ([]byte, error)) (err error) {
+func (f *freelist2) modifyPage(txh *txHeader, pageId uint32, buf []byte, fn func(b []byte) ([]byte, error)) (err error) {
 	if !txh.valid() {
 		buf, err = fn(buf)
 		if err != nil {
@@ -233,7 +226,7 @@ func (f *freelist2) modifyPage(txh *txHeader, pageId uint64, buf []byte, fn func
 	f.cache.opShadowPage(txh, cachePage{
 		txSeq: txh.seq,
 		data:  buf,
-		pgId:  createPageIdFromUint64(pageId),
+		pgId:  pageId,
 	}, func(p cachePage) (cachePage, bool) {
 		p.data, err = fn(p.data)
 		if err != nil {
@@ -245,10 +238,8 @@ func (f *freelist2) modifyPage(txh *txHeader, pageId uint64, buf []byte, fn func
 	return
 }
 
-func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
-	isSorted := slices.IsSortedFunc(pgIdList, func(a, b pageId) int {
-		return cmp.Compare(a.ToUint64(), b.ToUint64())
-	})
+func (f *freelist2) build(txh *txHeader, pgIdList []uint32) (err error) {
+	isSorted := slices.IsSorted(pgIdList)
 	if !isSorted {
 		return fmt.Errorf("pgIdList not sorted")
 	}
@@ -270,7 +261,7 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 				return
 			}
 		}
-		buf, err = f.readPage(txh, uint64(idx))
+		buf, err = f.readPage(txh, uint32(idx))
 		if err != nil {
 			return
 		}
@@ -281,23 +272,26 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 		if int(maxWrite) > len(pgIdList) {
 			maxWrite = uint32(len(pgIdList))
 		}
-		err = f.modifyPage(txh, uint64(idx), buf, func(buf2 []byte) ([]byte, error) {
+		err = f.modifyPage(txh, uint32(idx), buf, func(buf2 []byte) ([]byte, error) {
 			if idx == 0 {
-				writeLen := createPageIdFromUint64(uint64(len(pgIdList)))
-				copy(buf2[:pgIdMemSize], writeLen[:])
+				//writeLen := createPageIdFromUint64(uint64(len(pgIdList)))
+				//copy(buf2[:pgIdMemSize], writeLen[:])
+				binary.BigEndian.PutUint32(buf2, uint32(len(pgIdList)))
 				for i := 0; i < int(maxWrite); i++ {
-					copy(buf2[uintptr(i+1)*pgIdMemSize:], pgIdList[i][:])
+					//copy(buf2[uintptr(i+1)*pgIdMemSize:], pgIdList[i][:])
+					binary.BigEndian.PutUint32(buf2[uintptr(i+1)*pgIdMemSize:], pgIdList[i])
 				}
 			} else {
 				for i := 0; i < int(maxWrite); i++ {
-					copy(buf2[uintptr(i)*pgIdMemSize:], pgIdList[i][:])
+					//copy(buf2[uintptr(i)*pgIdMemSize:], pgIdList[i][:])
+					binary.BigEndian.PutUint32(buf2[uintptr(i)*pgIdMemSize:], pgIdList[i])
 				}
 			}
 			// 非初始化时写入页修改记录
 			if txh.valid() {
 				err = txh.addPageModify(pageRecord{
 					typ:  pageRecordFree,
-					pgId: createPageIdFromUint64(uint64(idx)),
+					pgId: uint32(idx),
 					off:  0,
 					dat:  buf2,
 				})
@@ -316,15 +310,15 @@ func (f *freelist2) build(txh *txHeader, pgIdList []pageId) (err error) {
 	return nil
 }
 
-func (f *freelist2) len(txh *txHeader) (uint64, error) {
+func (f *freelist2) len(txh *txHeader) (uint32, error) {
 	pos, err := f.position(txh, 0)
 	if err != nil {
 		return 0, err
 	}
-	return pos.getOfU8(), nil
+	return pos.get(), nil
 }
 
-func (f *freelist2) swap(txh *txHeader, i, j uint64) error {
+func (f *freelist2) swap(txh *txHeader, i, j uint32) error {
 	ipos, err := f.position(txh, i)
 	if err != nil {
 		return err
@@ -346,7 +340,7 @@ func (f *freelist2) swap(txh *txHeader, i, j uint64) error {
 	return nil
 }
 
-func (f *freelist2) less(txh *txHeader, i, j uint64) (bool, error) {
+func (f *freelist2) less(txh *txHeader, i, j uint32) (bool, error) {
 	ipos, err := f.position(txh, i)
 	if err != nil {
 		return false, err
@@ -355,10 +349,10 @@ func (f *freelist2) less(txh *txHeader, i, j uint64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return cmp.Less(ipos.getOfU8(), jpos.getOfU8()), nil
+	return cmp.Less(ipos.get(), jpos.get()), nil
 }
 
-func (f *freelist2) push(txh *txHeader, v pageId) error {
+func (f *freelist2) push(txh *txHeader, v uint32) error {
 	maxIdx, err := f.doPush(txh, v)
 	if err != nil {
 		return err
@@ -366,41 +360,41 @@ func (f *freelist2) push(txh *txHeader, v pageId) error {
 	return f.up(txh, maxIdx)
 }
 
-func (f *freelist2) pop(txh *txHeader) (p pageId, err error) {
+func (f *freelist2) pop(txh *txHeader) (p uint32, err error) {
 	var (
 		lengthPos *freelist2Pos
-		length    uint64
+		length    uint32
 	)
 	lengthPos, err = f.position(txh, 0)
 	if err != nil {
-		return pageId{}, err
+		return 0, err
 	}
-	length = lengthPos.getOfU8()
+	length = lengthPos.get()
 	if length == 0 {
-		return pageId{}, errNoAvailablePage
+		return 0, errNoAvailablePage
 	}
 	p, err = f.doPop(txh, length)
 	if err != nil {
-		return pageId{}, err
+		return 0, err
 	}
-	err = lengthPos.set(txh, createPageIdFromUint64(length-1))
+	err = lengthPos.set(txh, length-1)
 	if err != nil {
-		return pageId{}, err
+		return 0, err
 	}
 	err = f.down(txh, length-1)
 	return
 }
 
-func (f *freelist2) doPush(txh *txHeader, v pageId) (maxIdx uint64, err error) {
+func (f *freelist2) doPush(txh *txHeader, v uint32) (maxIdx uint32, err error) {
 	var (
 		isFull bool
-		length uint64
+		length uint32
 	)
 	lengthPos, err := f.position(txh, 0)
 	if err != nil {
 		return 0, err
 	}
-	length = lengthPos.getOfU8()
+	length = lengthPos.get()
 	if length > 0 {
 		isFull, err = f.isFull(length + 1)
 		if err != nil {
@@ -417,7 +411,7 @@ func (f *freelist2) doPush(txh *txHeader, v pageId) (maxIdx uint64, err error) {
 	if err != nil {
 		return 0, err
 	}
-	err = lengthPos.set(txh, createPageIdFromUint64(length+1))
+	err = lengthPos.set(txh, length+1)
 	if err != nil {
 		return 0, err
 	}
@@ -429,24 +423,24 @@ func (f *freelist2) doPush(txh *txHeader, v pageId) (maxIdx uint64, err error) {
 	return
 }
 
-func (f *freelist2) doPop(txh *txHeader, length uint64) (p pageId, err error) {
+func (f *freelist2) doPop(txh *txHeader, length uint32) (p uint32, err error) {
 	var (
 		lastPos, firstPos *freelist2Pos
 	)
 	lastPos, err = f.position(txh, length)
 	if err != nil {
-		return pageId{}, err
+		return 0, err
 	}
 	firstPos, err = f.position(txh, 1)
 	if err != nil {
-		return pageId{}, err
+		return 0, err
 	}
 	p = firstPos.get()
 	err = firstPos.set(txh, lastPos.get())
 	return
 }
 
-func (f *freelist2) up(txh *txHeader, endIdx uint64) error {
+func (f *freelist2) up(txh *txHeader, endIdx uint32) error {
 	currentIdx := endIdx
 	for {
 		parentIdx := currentIdx / 2
@@ -470,8 +464,8 @@ func (f *freelist2) up(txh *txHeader, endIdx uint64) error {
 	return nil
 }
 
-func (f *freelist2) down(txh *txHeader, endIdx uint64) error {
-	var idx uint64 = 1
+func (f *freelist2) down(txh *txHeader, endIdx uint32) error {
+	var idx uint32 = 1
 	for {
 		leftSubIdx := idx * 2
 		rightSubIdx := idx*2 + 1

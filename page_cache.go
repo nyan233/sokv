@@ -8,24 +8,24 @@ import (
 type cachePage struct {
 	txSeq uint64
 	data  []byte
-	pgId  pageId
+	pgId  uint32
 }
 
 type batchPutItem struct {
-	pgId uint64
+	pgId uint32
 	val  cachePage
 }
 
 type pageCacheI interface {
-	getPage(txh *txHeader, pgId uint64) (p cachePage, found bool)
-	putPage(txh *txHeader, pgId uint64, p cachePage) bool
+	getPage(txh *txHeader, pgId uint32) (p cachePage, found bool)
+	putPage(txh *txHeader, pgId uint32, p cachePage) bool
 	batchPutPage(txh *txHeader, l []batchPutItem) int
 	createShadowPage(txh *txHeader)
 	// writeBack == true则将改动写回到缓存中
 	deleteShadowPage(txh *txHeader, writeBack bool)
 	addShadowPages(txh *txHeader, pgs []cachePage)
-	existShadowPage(txh *txHeader, pgId uint64) bool
-	getShadowPageChange(txh *txHeader, pgId uint64) (cachePage, bool)
+	existShadowPage(txh *txHeader, pgId uint32) bool
+	getShadowPageChange(txh *txHeader, pgId uint32) (cachePage, bool)
 	opShadowPage(txh *txHeader, src cachePage, opFn func(p cachePage) (cachePage, bool))
 	cap() int64
 	len() int64
@@ -33,7 +33,7 @@ type pageCacheI interface {
 }
 
 type lfuNode struct {
-	pgId uint64
+	pgId uint32
 	val  cachePage
 	freq int
 	link *freqLink
@@ -49,7 +49,7 @@ type freqLink struct {
 }
 
 type shadowPageItem struct {
-	pgId uint64
+	pgId uint32
 	old  []byte
 	new  []byte
 }
@@ -57,22 +57,22 @@ type shadowPageItem struct {
 // 关联事务的影子页, 写事务中持有的是修改后的页, 读事务持有原页
 type txShadowPage struct {
 	seq     uint64
-	nodeMap map[uint64]*shadowPageItem
+	nodeMap map[uint32]*shadowPageItem
 	pool    sync.Pool
 }
 
-func (s *txShadowPage) item2CacheVal(pgId uint64, data []byte) cachePage {
+func (s *txShadowPage) item2CacheVal(pgId uint32, data []byte) cachePage {
 	return cachePage{
 		txSeq: s.seq,
 		data:  data,
-		pgId:  createPageIdFromUint64(pgId),
+		pgId:  pgId,
 	}
 }
 
 // lfuCache see : https://arxiv.org/pdf/2110.11602
 type lfuCache struct {
 	shadowPage *txShadowPage
-	nodeMap    map[uint64]*lfuNode
+	nodeMap    map[uint32]*lfuNode
 	freqRoot   *freqLink
 	capacity   int64
 	size       atomic.Int64
@@ -84,7 +84,7 @@ func newLFUCache(capacity int) pageCacheI {
 		panic("capacity must be a multiple of 64")
 	}
 	return &lfuCache{
-		nodeMap: make(map[uint64]*lfuNode, 256),
+		nodeMap: make(map[uint32]*lfuNode, 256),
 		freqRoot: &freqLink{
 			freq: 0,
 			prev: nil,
@@ -94,7 +94,7 @@ func newLFUCache(capacity int) pageCacheI {
 	}
 }
 
-func (l *lfuCache) getPage(txh *txHeader, pgId uint64) (p cachePage, found bool) {
+func (l *lfuCache) getPage(txh *txHeader, pgId uint32) (p cachePage, found bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.shadowPage != nil {
@@ -162,13 +162,13 @@ func (l *lfuCache) newFreqLink(prev, next *freqLink) *freqLink {
 	return newVal
 }
 
-func (l *lfuCache) putPage(txh *txHeader, pgId uint64, p cachePage) bool {
+func (l *lfuCache) putPage(txh *txHeader, pgId uint32, p cachePage) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.doPut(pgId, p)
 }
 
-func (l *lfuCache) doPut(pgId uint64, p cachePage) bool {
+func (l *lfuCache) doPut(pgId uint32, p cachePage) bool {
 	cacheVal, ok := l.nodeMap[pgId]
 	// only update
 	if ok {
@@ -238,7 +238,7 @@ func (l *lfuCache) createShadowPage(txh *txHeader) {
 	defer l.mu.Unlock()
 	l.shadowPage = &txShadowPage{
 		seq:     txh.seq,
-		nodeMap: make(map[uint64]*shadowPageItem, 8),
+		nodeMap: make(map[uint32]*shadowPageItem, 8),
 		pool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, 0, recordSize)
@@ -258,7 +258,7 @@ func (l *lfuCache) deleteShadowPage(txh *txHeader, writeBack bool) {
 				l.doPut(v.pgId, cachePage{
 					txSeq: txh.seq,
 					data:  v.new,
-					pgId:  createPageIdFromUint64(v.pgId),
+					pgId:  v.pgId,
 				})
 			}
 		}
@@ -278,7 +278,7 @@ func (l *lfuCache) addShadowPages(txh *txHeader, pgs []cachePage) {
 }
 
 func (l *lfuCache) addShadowPage(txh *txHeader, pg cachePage) {
-	pgId := pg.pgId.ToUint64()
+	pgId := pg.pgId
 	item, ok := l.shadowPage.nodeMap[pgId]
 	if !ok {
 		oldData := l.shadowPage.pool.Get().([]byte)
@@ -295,7 +295,7 @@ func (l *lfuCache) addShadowPage(txh *txHeader, pg cachePage) {
 	}
 }
 
-func (l *lfuCache) existShadowPage(txh *txHeader, pgId uint64) bool {
+func (l *lfuCache) existShadowPage(txh *txHeader, pgId uint32) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	_, ok := l.shadowPage.nodeMap[pgId]
@@ -305,7 +305,7 @@ func (l *lfuCache) existShadowPage(txh *txHeader, pgId uint64) bool {
 func (l *lfuCache) opShadowPage(txh *txHeader, src cachePage, opFn func(p cachePage) (cachePage, bool)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, ok := l.shadowPage.nodeMap[src.pgId.ToUint64()]
+	_, ok := l.shadowPage.nodeMap[src.pgId]
 	if !ok {
 		l.addShadowPage(txh, src)
 	}
@@ -316,7 +316,7 @@ func (l *lfuCache) opShadowPage(txh *txHeader, src cachePage, opFn func(p cacheP
 	l.addShadowPage(txh, dst)
 }
 
-func (l *lfuCache) getShadowPageChange(txh *txHeader, pgId uint64) (cachePage, bool) {
+func (l *lfuCache) getShadowPageChange(txh *txHeader, pgId uint32) (cachePage, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	item, ok := l.shadowPage.nodeMap[pgId]

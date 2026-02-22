@@ -8,13 +8,12 @@ import (
 	"hash/crc32"
 	"log/slog"
 	"os"
-	"strconv"
 	"unsafe"
 )
 
 const (
 	defaultPageCount = 256
-	pgIdMemSize      = unsafe.Sizeof(pageId{})
+	pgIdMemSize      = unsafe.Sizeof(uint32(0))
 	// 8KB
 	recordSize = 8 * 1024
 )
@@ -26,7 +25,7 @@ const (
 )
 
 var (
-	medataHeader = [4]byte{'c', 'a', 'f', 'e'}
+	medataHeader = [4]byte{'s', 'o', 'k', 'v'}
 )
 
 func init() {
@@ -39,7 +38,7 @@ func init() {
 type metaHeader struct {
 	header       [4]byte
 	sum          uint32
-	rootNodePgId pageId
+	rootNodePgId uint32
 	datLen       uint16
 }
 
@@ -63,30 +62,32 @@ func (m *metadata) parse(v []byte) {
 		panic("value too short")
 	}
 	m.rawBuf = v
-	m.header.header = [4]byte(v[0:4])
-	m.header.sum = binary.BigEndian.Uint32(v[4:8])
-	m.header.rootNodePgId = pageId(v[8:14])
-	m.header.datLen = binary.BigEndian.Uint16(v[14:16])
-	m.data = v[16:]
+	// m.header.header = [4]byte(v[0:4])
+	m.header.header = popBytes(&v, 4, func(a0 []byte) [4]byte {
+		return [4]byte(v)
+	})
+	// m.header.sum = binary.BigEndian.Uint32(v[4:8])
+	m.header.sum = popBytes(&v, 4, binary.BigEndian.Uint32)
+	m.header.rootNodePgId = popBytes(&v, 4, binary.BigEndian.Uint32)
+	m.header.datLen = popBytes(&v, 2, binary.BigEndian.Uint16)
+	m.data = v
 }
 
 func (m *metadata) writeHeader2RawBuf() {
 	copy(m.rawBuf[0:4], m.header.header[:])
-	copy(m.rawBuf[8:14], m.header.rootNodePgId[:])
-	binary.BigEndian.PutUint16(m.rawBuf[14:16], m.header.datLen)
+	binary.BigEndian.PutUint32(m.rawBuf[8:12], m.header.rootNodePgId)
+	binary.BigEndian.PutUint16(m.rawBuf[12:14], m.header.datLen)
 	// update checksum
 	m.header.sum = crc32.ChecksumIEEE(m.rawBuf[8:])
 	binary.BigEndian.PutUint32(m.rawBuf[4:], m.header.sum)
 }
 
 type pageHeader struct {
-	Header uint8
-	sum    uint32
-	// PgId msb ~= 2^48
-	PgId  pageId
-	Flags uint64
-	// PgId msb ~= 2^48
-	Overflow pageId
+	Header   uint8
+	sum      uint32
+	PgId     uint32
+	Flags    uint64
+	Overflow uint32
 }
 
 type pageDesc struct {
@@ -97,12 +98,8 @@ type pageDesc struct {
 	Data   []byte
 }
 
-func (p *pageDesc) id() pageId {
+func (p *pageDesc) id() uint32 {
 	return p.Header.PgId
-}
-
-func (p *pageDesc) idOfU8() uint64 {
-	return p.Header.PgId.ToUint64()
 }
 
 func (p *pageDesc) minSize() uint32 {
@@ -120,12 +117,16 @@ func (p *pageDesc) parse(v []byte) {
 		panic("v length too short")
 	}
 	p.rawBuf = v
-	p.Header.Header = v[0]
-	p.Header.sum = binary.BigEndian.Uint32(v[1:5])
-	p.Header.PgId = pageId(v[5:11])
-	p.Header.Flags = binary.BigEndian.Uint64(v[11:19])
-	p.Header.Overflow = pageId(v[19:25])
-	p.Data = v[25:]
+	// v[0]
+	p.Header.Header = popBytes(&v, 1, func(a0 []byte) uint8 {
+		return a0[0]
+	})
+	// p.Header.sum = binary.BigEndian.Uint32(v[1:5])
+	p.Header.sum = popBytes(&v, 4, binary.BigEndian.Uint32)
+	p.Header.PgId = popBytes(&v, 4, binary.BigEndian.Uint32)
+	p.Header.Flags = popBytes(&v, 8, binary.BigEndian.Uint64)
+	p.Header.Overflow = popBytes(&v, 16, binary.BigEndian.Uint32)
+	p.Data = v
 }
 
 func (p *pageDesc) checksum() uint32 {
@@ -134,37 +135,13 @@ func (p *pageDesc) checksum() uint32 {
 
 func (p *pageDesc) writeHeader2RawBuf() {
 	p.rawBuf[0] = p.Header.Header
-	copy(p.rawBuf[5:11], p.Header.PgId[:])
-	binary.BigEndian.PutUint64(p.rawBuf[11:19], p.Header.Flags)
-	copy(p.rawBuf[19:25], p.Header.Overflow[:])
+	binary.BigEndian.PutUint32(p.rawBuf[5:9], p.Header.PgId)
+	binary.BigEndian.PutUint64(p.rawBuf[9:17], p.Header.Flags)
+	binary.BigEndian.PutUint32(p.rawBuf[17:21], p.Header.Overflow)
 
 	// update checksum
 	p.Header.sum = crc32.ChecksumIEEE(p.rawBuf[5:])
 	binary.BigEndian.PutUint32(p.rawBuf[1:5], p.Header.sum)
-}
-
-type pageId [6]byte
-
-func (p *pageId) ToUint64() uint64 {
-	return uint64(p[0])<<40 | uint64(p[1])<<32 | uint64(p[2])<<24 | uint64(p[3])<<16 | uint64(p[4])<<8 | uint64(p[5])
-}
-
-func (p *pageId) FromUint64(v uint64) {
-	p[0] = byte(v >> 40)
-	p[1] = byte(v >> 32)
-	p[2] = byte(v >> 24)
-	p[3] = byte(v >> 16)
-	p[4] = byte(v >> 8)
-	p[5] = byte(v)
-}
-
-func (p *pageId) String() string {
-	return strconv.FormatUint(p.ToUint64(), 10)
-}
-
-func createPageIdFromUint64(v uint64) (p pageId) {
-	p.FromUint64(v)
-	return
 }
 
 type pageStorageOption struct {
@@ -230,19 +207,19 @@ func (m *pageStorage) initFile() (err error) {
 		return
 	}
 	md.header.header = medataHeader
-	md.header.rootNodePgId.FromUint64(2)
+	md.header.rootNodePgId = 2
 	md.writeHeader2RawBuf()
-	err = m.writeRawPage(createPageIdFromUint64(0), md.rawBuf)
+	err = m.writeRawPage(0, md.rawBuf)
 	if err != nil {
 		return
 	}
 	if m.cipher != nil {
 		zeroBuf := make([]byte, recordSize)
-		err = m.writeRawPage(createPageIdFromUint64(1), zeroBuf)
+		err = m.writeRawPage(1, zeroBuf)
 		if err != nil {
 			return
 		}
-		err = m.writeRawPage(createPageIdFromUint64(2), zeroBuf)
+		err = m.writeRawPage(2, zeroBuf)
 		if err != nil {
 			return
 		}
@@ -257,7 +234,7 @@ func (m *pageStorage) getMetadata(txh *txHeader, isInit bool) (metadata, error) 
 		md.parse(cp.data)
 		return md, nil
 	}
-	rawPage, err := m.readRawPage(createPageIdFromUint64(0))
+	rawPage, err := m.readRawPage(0)
 	if err != nil {
 		return md, err
 	}
@@ -271,12 +248,12 @@ func (m *pageStorage) getMetadata(txh *txHeader, isInit bool) (metadata, error) 
 	m.cache.putPage(txh, 0, cachePage{
 		txSeq: 0,
 		data:  md.rawBuf,
-		pgId:  createPageIdFromUint64(0),
+		pgId:  0,
 	})
 	return md, nil
 }
 
-func (m *pageStorage) grow(txh *txHeader) (pageIdList []pageId, err error) {
+func (m *pageStorage) grow(txh *txHeader) (pageIdList []uint32, err error) {
 	// 大于1GB之后每次增长1GB, 小于1GB则*2
 	stat, err := m.file.Stat()
 	if err != nil {
@@ -294,9 +271,9 @@ func (m *pageStorage) grow(txh *txHeader) (pageIdList []pageId, err error) {
 	freePageStart := fileSize / int64(recordSize)
 	freePageEnd := newFileSize / int64(recordSize)
 	pageCount := uint64((newFileSize - fileSize) / int64(recordSize))
-	pageIdList = make([]pageId, 0, pageCount)
+	pageIdList = make([]uint32, 0, pageCount)
 	for i := freePageStart; i < freePageEnd; i++ {
-		pageIdList = append(pageIdList, createPageIdFromUint64(uint64(i)))
+		pageIdList = append(pageIdList, uint32(i))
 	}
 	return
 }
@@ -311,7 +288,7 @@ func (m *pageStorage) close() (err error) {
 	return
 }
 
-func (m *pageStorage) readRootPage(txh *txHeader) (pgId pageId, err error) {
+func (m *pageStorage) readRootPage(txh *txHeader) (pgId uint32, err error) {
 	var md metadata
 	md, err = m.getMetadata(txh, false)
 	if err != nil {
@@ -321,11 +298,11 @@ func (m *pageStorage) readRootPage(txh *txHeader) (pgId pageId, err error) {
 	}
 }
 
-func (m *pageStorage) setRootPage(txh *txHeader, pgId pageId) error {
+func (m *pageStorage) setRootPage(txh *txHeader, pgId uint32) error {
 	return m.setRootPageWithPageId(txh, pgId)
 }
 
-func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) error {
+func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId uint32) error {
 	if txh.isWriteTx() {
 		return fmt.Errorf("current tx type not is write")
 	}
@@ -333,18 +310,17 @@ func (m *pageStorage) setRootPageWithPageId(txh *txHeader, rootPgId pageId) erro
 	if err != nil {
 		return err
 	}
-	pgId := createPageIdFromUint64(0)
 	m.cache.opShadowPage(txh, cachePage{
 		txSeq: txh.seq,
 		data:  md.rawBuf,
-		pgId:  pgId,
+		pgId:  0,
 	}, func(p cachePage) (cachePage, bool) {
 		md.header.rootNodePgId = rootPgId
 		md.writeHeader2RawBuf()
 		err = txh.addPageModify(pageRecord{
 			typ: pageRecordStorage,
 			// metadata pageId
-			pgId: pgId,
+			pgId: 0,
 			off:  0,
 			dat:  md.rawBuf[:md.minSize()],
 		})
@@ -366,13 +342,12 @@ func (m *pageStorage) setLocalData(b []byte) error {
 	md.header.datLen = uint16(len(b))
 	copy(md.data, b)
 	md.writeHeader2RawBuf()
-	pgId := createPageIdFromUint64(0)
 	m.cache.putPage(nil, 0, cachePage{
 		txSeq: 0,
 		data:  md.rawBuf,
-		pgId:  pgId,
+		pgId:  0,
 	})
-	return m.writeRawPage(pgId, md.rawBuf)
+	return m.writeRawPage(0, md.rawBuf)
 }
 
 func (m *pageStorage) loadLocalData() ([]byte, error) {
@@ -438,7 +413,7 @@ func (m *pageStorage) flushShadowPage2Disk(txh *txHeader) error {
 		if !ok {
 			return fmt.Errorf("tx have page change, but no shadow page : %d", pgId)
 		}
-		err := m.writeRawPage(createPageIdFromUint64(pgId), p.data)
+		err := m.writeRawPage(pgId, p.data)
 		if err != nil {
 			return err
 		}
@@ -479,13 +454,13 @@ func (m *pageStorage) modifyPage(txh *txHeader, pd pageDesc, fn func(pd pageDesc
 	return
 }
 
-func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
+func (m *pageStorage) readRawPage(pgId uint32) ([]byte, error) {
 	buf := make([]byte, recordSize)
-	readCount, err := m.file.ReadAt(buf, int64(pgId.ToUint64()*uint64(recordSize)))
+	readCount, err := m.file.ReadAt(buf, int64(pgId*recordSize))
 	if err != nil {
 		return nil, err
 	}
-	if readCount != int(recordSize) {
+	if readCount != recordSize {
 		return nil, fmt.Errorf("read %d bytes instead of expected %d", readCount, readCount)
 	}
 	if m.cipher != nil && !bytesIsZero(buf) {
@@ -497,12 +472,12 @@ func (m *pageStorage) readRawPage(pgId pageId) ([]byte, error) {
 	return buf, nil
 }
 
-func (m *pageStorage) readPage(txh *txHeader, pgId pageId) (pd pageDesc, err error) {
-	if pgId.ToUint64() < 2 {
-		err = fmt.Errorf("read page type not is dat : %d", pgId.ToUint64())
+func (m *pageStorage) readPage(txh *txHeader, pgId uint32) (pd pageDesc, err error) {
+	if pgId < 2 {
+		err = fmt.Errorf("read page type not is dat : %d", pgId)
 		return
 	}
-	cp, found := m.cache.getPage(txh, pgId.ToUint64())
+	cp, found := m.cache.getPage(txh, pgId)
 	if found {
 		pd.parse(cp.data)
 	} else {
@@ -520,7 +495,7 @@ func (m *pageStorage) readPage(txh *txHeader, pgId pageId) (pd pageDesc, err err
 		}
 	}
 	if !found {
-		m.cache.putPage(txh, pgId.ToUint64(), cachePage{
+		m.cache.putPage(txh, pgId, cachePage{
 			txSeq: 0,
 			data:  pd.rawBuf,
 			pgId:  pgId,
@@ -529,7 +504,7 @@ func (m *pageStorage) readPage(txh *txHeader, pgId pageId) (pd pageDesc, err err
 	return
 }
 
-func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) (err error) {
+func (m *pageStorage) writeRawPage(pgId uint32, buf []byte) (err error) {
 	if m.cipher != nil {
 		buf, err = m.cipher.Encrypt(buf)
 		if err != nil {
@@ -537,7 +512,7 @@ func (m *pageStorage) writeRawPage(pgId pageId, buf []byte) (err error) {
 		}
 		defer m.cipher.free(buf)
 	}
-	writeCount, err := m.file.WriteAt(buf, int64(pgId.ToUint64()*uint64(recordSize)))
+	writeCount, err := m.file.WriteAt(buf, int64(pgId*recordSize))
 	if err != nil {
 		return err
 	}
